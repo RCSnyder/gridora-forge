@@ -3,10 +3,316 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Gridora Forge</title>
+    <meta name="theme-color" content="#0c0f14" />
+
+    <!-- Primary SEO -->
+    <title>
+      Gridora Forge — Free Construction Photo Report &amp; Inspection Log PDF
+      Generator
+    </title>
+    <meta
+      name="description"
+      content="Free tool for construction workers, inspectors, and consultants to build professional site photo reports in minutes. Drag-and-drop jobsite photos from your phone or camera, add descriptions, choose a layout, and export a branded PDF inspection log. No app to install, no account needed — runs 100% in your browser."
+    />
+    <meta
+      name="keywords"
+      content="construction photo report, site inspection report, construction photo log, inspection report generator, jobsite photo documentation, building inspection report, construction daily report, punch list photo report, site visit report, field report generator, property inspection report, construction progress photos, photo log template, PDF report builder, construction documentation tool, AIA photo documentation, contractor report, engineering site report, environmental inspection, insurance claim photos, site survey report, construction consultant tools, free construction software, photo report app"
+    />
+    <meta name="author" content="R. Cooper Snyder" />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://www.gridora-forge.com/" />
+
+    <!-- Open Graph (Facebook, LinkedIn, iMessage, Slack, Discord) -->
+    <meta property="og:type" content="website" />
+    <meta
+      property="og:title"
+      content="Gridora Forge: Free Construction Photo Report Generator"
+    />
+    <meta
+      property="og:description"
+      content="Build professional site inspection photo reports and PDF logs in minutes. Drag-and-drop jobsite photos, add notes, pick a layout, export to PDF. Free — no installs, no accounts, no uploads. Built for construction workers, inspectors, and consultants."
+    />
+    <meta property="og:url" content="https://www.gridora-forge.com/" />
+    <meta property="og:site_name" content="Gridora Forge" />
+    <meta property="og:locale" content="en_US" />
+    <meta
+      property="og:image"
+      content="https://www.gridora-forge.com/og-image.png"
+    />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:type" content="image/png" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta
+      name="twitter:title"
+      content="Gridora Forge — Free Construction Photo Report Generator"
+    />
+    <meta
+      name="twitter:description"
+      content="Turn jobsite photos into professional PDF inspection reports in minutes. Drag, drop, label, export. Free and runs entirely in your browser — nothing leaves your device."
+    />
+    <meta
+      name="twitter:image"
+      content="https://www.gridora-forge.com/og-image.png"
+    />
+
+    <!-- Favicon & Icons -->
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+
+    <!-- Structured Data (JSON-LD) — WebApplication -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "Gridora Forge",
+        "alternateName": "Gridora Forge Photo Report Generator",
+        "url": "https://www.gridora-forge.com/",
+        "description": "Free browser-based construction photo report and inspection log PDF generator. Designed for construction workers, site inspectors, consultants, and engineers who need to turn jobsite photos into professional PDF reports quickly. Drag-and-drop photos, add titles and descriptions, choose grid layouts (1-up, 2-up, 2x2, 2x3), include a branded cover page with your company logo, and export to PDF. No uploads, no accounts, everything stays on your device.",
+        "applicationCategory": "BusinessApplication",
+        "applicationSubCategory": "Construction Documentation",
+        "operatingSystem": "Any (browser-based)",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "author": {
+          "@type": "Person",
+          "name": "R. Cooper Snyder",
+          "url": "https://github.com/RCSnyder"
+        },
+        "audience": {
+          "@type": "Audience",
+          "audienceType": "Construction professionals, site inspectors, building consultants, engineers, contractors, project managers"
+        },
+        "featureList": "Drag-and-drop photo import, HEIC/iPhone support, photo captions and descriptions, multiple grid layouts, branded cover page with logo, configurable PDF margins, headers and footers, page numbers, reorder by drag, rotate photos, 100% client-side processing",
+        "browserRequirements": "Requires a modern browser with WebAssembly support (Chrome, Firefox, Safari, Edge)",
+        "softwareVersion": "1.0.0",
+        "license": "https://opensource.org/licenses/MIT",
+        "image": "https://www.gridora-forge.com/og-image.png"
+      }
+    </script>
+
+    <!-- Structured Data (JSON-LD) — FAQ for long-tail search -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "How do I create a construction photo report?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "With Gridora Forge, open the app in your browser, drag and drop your jobsite photos, add titles and descriptions to each photo, choose a page layout (1-up for detailed shots, 2×3 for overview grids), optionally add a branded cover page with your company logo, and click Export to PDF. The entire process takes minutes and everything runs locally in your browser — no uploads required."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Is Gridora Forge free to use?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes, Gridora Forge is completely free. There are no accounts, subscriptions, or hidden fees. It runs entirely in your browser and your photos never leave your device."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Can I use photos from my iPhone on a construction site?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. Gridora Forge supports HEIC/HEIF photos from iPhones and iPads, as well as standard JPEG and PNG formats. Just AirDrop or transfer your jobsite photos to your computer and drag them into the app."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "What layouts are available for photo reports?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Gridora Forge offers four layouts: 1-up (one large photo per page, ideal for detailed inspection shots), 2-up (two photos stacked vertically), 2×2 (four photos per page in a grid), and 2×3 (six photos per page for high-density overview reports)."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Do my photos get uploaded to a server?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "No. Gridora Forge processes everything locally in your browser using WebAssembly. Your photos, report data, and exported PDFs never leave your device. This makes it safe for confidential project documentation and client-sensitive inspection reports."
+            }
+          }
+        ]
+      }
+    </script>
+
+    <!-- Trunk assets -->
     <link data-trunk rel="css" href="styles.css" />
-    <link data-trunk rel="copy-dir" href="public" />
+    <link data-trunk rel="copy-file" href="public/og-image.png" />
+    <link data-trunk rel="copy-file" href="public/apple-touch-icon.png" />
+    <link data-trunk rel="copy-file" href="public/favicon.ico" />
+    <link data-trunk rel="copy-file" href="public/robots.txt" />
+    <link data-trunk rel="copy-file" href="public/sitemap.xml" />
+    <link data-trunk rel="copy-file" href="public/CNAME" />
     <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
   </head>
-  <body></body>
+  <body>
+    <!-- SEO fallback: crawlers can't execute WASM, so provide indexable content -->
+    <noscript>
+      <h1>Gridora Forge — Free Construction Photo Report Generator</h1>
+      <p><strong>Drag. Drop. Label. Export to PDF.</strong></p>
+      <p>No Installs &mdash; No Uploads &mdash; 100% Private in Browser</p>
+
+      <p>
+        Gridora Forge is a free, browser-based tool built for construction
+        workers, site inspectors, consultants, and engineers who need to turn
+        jobsite photos into professional PDF reports quickly. No software to
+        install, no accounts to create, no photos uploaded to any server —
+        everything runs locally on your device.
+      </p>
+
+      <h2>Built for the Jobsite</h2>
+      <p>
+        Whether you're documenting a site inspection, creating a construction
+        progress report, building a punch list with photos, or putting together
+        a property condition assessment, Gridora Forge gets you from raw photos
+        to a polished PDF in minutes. Take photos on your phone, transfer them
+        to your laptop, drag them into the app, and export.
+      </p>
+
+      <h2>How It Works</h2>
+      <ol>
+        <li>
+          <strong>Add photos</strong> — Drag and drop jobsite photos (JPEG, PNG,
+          HEIC from iPhone) or click to browse. Add entire folders at once.
+        </li>
+        <li>
+          <strong>Label and describe</strong> — Give each photo a title (e.g.,
+          "North Elevation — Crack in Foundation") and a description with
+          observations, measurements, or notes.
+        </li>
+        <li>
+          <strong>Choose a layout</strong> — Pick the right density for your
+          report: 1-up for detailed inspection shots, 2-up for paired
+          before/after, 2&times;2 or 2&times;3 grids for overview documentation.
+        </li>
+        <li>
+          <strong>Add a title page</strong> — Include your company logo, project
+          name, site address, report author, date, and notes on a professional
+          cover page.
+        </li>
+        <li>
+          <strong>Export to PDF</strong> — One click generates a print-ready PDF
+          with configurable margins, headers, footers, and page numbers.
+        </li>
+      </ol>
+
+      <h2>Key Features</h2>
+      <ul>
+        <li>
+          Drag-and-drop photo import — supports JPEG, PNG, and HEIC/HEIF from
+          iPhones
+        </li>
+        <li>
+          Folder import — add an entire directory of jobsite photos at once
+        </li>
+        <li>
+          Photo captions — title and multi-line description for each image
+        </li>
+        <li>Photo rotation — fix orientation without leaving the app</li>
+        <li>
+          Drag-to-reorder — arrange photos in the sequence that tells your story
+        </li>
+        <li>Four page layouts: 1-up, 2-up, 2&times;2 grid, 2&times;3 grid</li>
+        <li>
+          Branded cover page with logo, project info, author, date, and notes
+        </li>
+        <li>
+          Configurable PDF margins, custom headers and footers with template
+          variables
+        </li>
+        <li>Page numbers</li>
+        <li>Live preview — see exactly what will print before exporting</li>
+        <li>
+          100% client-side — no uploads, no server, no account, no subscription
+        </li>
+        <li>Works on Chrome, Firefox, Safari, and Edge</li>
+      </ul>
+
+      <h2>Who Uses Gridora Forge?</h2>
+      <ul>
+        <li>
+          <strong>General contractors</strong> — Daily construction progress
+          reports with annotated photos
+        </li>
+        <li>
+          <strong>Site inspectors</strong> — Building inspection photo logs for
+          code compliance and deficiency documentation
+        </li>
+        <li>
+          <strong>Construction consultants</strong> — Professional site visit
+          reports for clients with branded cover pages
+        </li>
+        <li>
+          <strong>Engineers</strong> — Structural assessment documentation and
+          field observation reports
+        </li>
+        <li>
+          <strong>Project managers</strong> — Weekly progress photo updates for
+          owners and stakeholders
+        </li>
+        <li>
+          <strong>Subcontractors</strong> — Pre-condition photo documentation
+          before starting work
+        </li>
+        <li>
+          <strong>Property inspectors</strong> — Residential and commercial
+          property condition reports
+        </li>
+        <li>
+          <strong>Insurance adjusters</strong> — Claim documentation with
+          detailed photo evidence
+        </li>
+        <li>
+          <strong>Environmental consultants</strong> — Site assessment photo
+          documentation
+        </li>
+        <li>
+          <strong>Roofing contractors</strong> — Roof inspection reports with
+          labeled damage photos
+        </li>
+      </ul>
+
+      <h2>Why Gridora Forge Instead of Word or PowerPoint?</h2>
+      <p>
+        Pasting photos into Word documents or PowerPoint slides is slow,
+        tedious, and produces inconsistent results. Gridora Forge is
+        purpose-built for photo reports: photos automatically size to fill the
+        page, captions stay with their images, layouts are consistent across
+        every page, and the exported PDF looks professional every time. What
+        takes 30+ minutes in Word takes 2 minutes in Gridora Forge.
+      </p>
+
+      <h2>Privacy &amp; Security</h2>
+      <p>
+        Gridora Forge runs entirely in your web browser using WebAssembly
+        technology. Your photos are never uploaded to any server. Your report
+        data never leaves your device. This makes it safe for confidential
+        project documentation, client-sensitive inspection reports, and any
+        situation where data privacy matters.
+      </p>
+
+      <p>
+        This application requires JavaScript and WebAssembly. Please enable
+        JavaScript to use Gridora Forge.
+      </p>
+    </noscript>
+
+    <!-- Analytics (cookie-free, GDPR-friendly) -->
+    <script
+      data-goatcounter="https://rcsnyder.goatcounter.com/count"
+      async
+      src="//gc.zgo.at/count.js"
+    ></script>
+  </body>
 </html>

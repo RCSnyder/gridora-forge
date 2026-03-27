@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>OG Image – Gridora Forge</title>
+    <style>
+      /* Exactly 1200 × 630 — screenshot this at 1× scale */
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+        font-family:
+          Inter,
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        background: #0c0f14;
+        color: #dce3ef;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        position: relative;
+      }
+
+      /* Subtle grid pattern background */
+      body::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(rgba(91, 156, 245, 0.04) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(91, 156, 245, 0.04) 1px, transparent 1px);
+        background-size: 40px 40px;
+        pointer-events: none;
+      }
+
+      /* Accent glow */
+      body::after {
+        content: "";
+        position: absolute;
+        top: -120px;
+        right: -80px;
+        width: 500px;
+        height: 500px;
+        background: radial-gradient(
+          circle,
+          rgba(91, 156, 245, 0.12) 0%,
+          transparent 70%
+        );
+        pointer-events: none;
+      }
+
+      .content {
+        position: relative;
+        z-index: 1;
+        text-align: center;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 20px;
+      }
+
+      /* Camera icon (SVG inline) */
+      .icon {
+        width: 72px;
+        height: 72px;
+        opacity: 0.7;
+      }
+
+      .brand {
+        font-size: 64px;
+        font-weight: 800;
+        letter-spacing: -1.5px;
+        line-height: 1.1;
+        color: #ffffff;
+      }
+
+      .brand span {
+        color: #5b9cf5;
+      }
+
+      .tagline {
+        font-size: 26px;
+        font-weight: 400;
+        color: #6e7d93;
+        line-height: 1.4;
+        max-width: 800px;
+      }
+
+      .tagline strong {
+        color: #dce3ef;
+        font-weight: 600;
+      }
+
+      .pills {
+        display: flex;
+        gap: 12px;
+        margin-top: 8px;
+      }
+
+      .pill {
+        font-size: 15px;
+        font-weight: 500;
+        color: #5b9cf5;
+        background: rgba(91, 156, 245, 0.1);
+        border: 1px solid rgba(91, 156, 245, 0.2);
+        border-radius: 999px;
+        padding: 8px 20px;
+        letter-spacing: 0.2px;
+      }
+
+      .bottom {
+        position: absolute;
+        bottom: 28px;
+        font-size: 14px;
+        color: #3d4a5c;
+        letter-spacing: 0.5px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="content">
+      <!-- Camera icon -->
+      <svg
+        class="icon"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="#5b9cf5"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path
+          d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"
+        />
+        <circle cx="12" cy="13" r="4" />
+      </svg>
+
+      <div class="brand">Gridora <span>Forge</span></div>
+
+      <div class="tagline">
+        Free <strong>Construction Photo Report</strong> Generator
+      </div>
+
+      <div class="pills">
+        <span class="pill">Drag & Drop</span>
+        <span class="pill">Label Photos</span>
+        <span class="pill">Export to PDF</span>
+      </div>
+    </div>
+
+    <div class="bottom">
+      No installs · No uploads · 100% private in your browser
+    </div>
+  </body>
+</html>

@@ -1,25 +1,28 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use gloo_file::futures::read_as_bytes;
-use js_sys::{Array, Uint8Array};
+use futures::stream::{self, StreamExt};
 use leptos::prelude::*;
-use rust_xlsxwriter::{Format, Image, Workbook};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    Blob, BlobPropertyBag, CanvasRenderingContext2d, HtmlAnchorElement, HtmlCanvasElement,
-    HtmlDocument, HtmlElement, HtmlInputElement, HtmlTextAreaElement, ImageBitmap, Url,
+    Blob, CanvasRenderingContext2d, HtmlCanvasElement, HtmlDocument, HtmlInputElement,
+    HtmlTextAreaElement, ImageBitmap,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 fn next_photo_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+// Holds the original source File blobs keyed by photo ID so we can
+// defer the expensive export-JPEG compression to PDF-export time.
+thread_local! {
+    static SOURCE_FILES: RefCell<HashMap<u64, web_sys::File>> = RefCell::new(HashMap::new());
 }
 
 // ---------------------------------------------------------------------------
@@ -33,6 +36,31 @@ struct ReportMeta {
     author: String,
     date: String,
     notes: String,
+    /// Base64 data-URL of a user-uploaded logo for the cover page.
+    logo_data_url: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct PdfSettings {
+    margin_top_in: f64,
+    margin_right_in: f64,
+    margin_bottom_in: f64,
+    margin_left_in: f64,
+    header_template: String,
+    footer_template: String,
+}
+
+impl Default for PdfSettings {
+    fn default() -> Self {
+        Self {
+            margin_top_in: 0.25,
+            margin_right_in: 0.25,
+            margin_bottom_in: 0.25,
+            margin_left_in: 0.25,
+            header_template: String::new(),
+            footer_template: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,6 +101,7 @@ impl GridLayout {
         self.rows() * self.cols()
     }
 
+    #[allow(dead_code)]
     fn value(self) -> &'static str {
         match self {
             GridLayout::OneUp => "1up",
@@ -90,11 +119,26 @@ struct PhotoItem {
     description: String,
     filename: String,
     mime: String,
+    rotation_quadrants: u8,
     /// Small data-URL thumbnail (~128 px) for the left-pane list.
     thumb_url: String,
     /// Medium data-URL preview (~600 px) for the right-pane page cards.
     preview_url: String,
-    bytes: Arc<[u8]>,
+}
+
+impl PhotoItem {
+    fn rotation_degrees(&self) -> u16 {
+        (self.rotation_quadrants as u16 % 4) * 90
+    }
+
+    fn rotation_style(&self) -> String {
+        let degrees = self.rotation_degrees();
+        if degrees == 0 {
+            String::new()
+        } else {
+            format!("transform: rotate({degrees}deg);")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,49 +186,65 @@ fn title_from_filename(name: &str) -> String {
     }
 }
 
+fn rotate_photo(items: &mut [PhotoItem], photo_id: u64, delta: i8) {
+    if let Some(item) = items.iter_mut().find(|photo| photo.id == photo_id) {
+        let base = item.rotation_quadrants as i8;
+        item.rotation_quadrants = (base + delta).rem_euclid(4) as u8;
+    }
+}
+
+fn update_photo_title(items: &mut [PhotoItem], photo_id: u64, title: String) {
+    if let Some(item) = items.iter_mut().find(|photo| photo.id == photo_id) {
+        item.title = title;
+    }
+}
+
+fn update_photo_description(items: &mut [PhotoItem], photo_id: u64, description: String) {
+    if let Some(item) = items.iter_mut().find(|photo| photo.id == photo_id) {
+        item.description = description;
+    }
+}
+
+fn update_pdf_margin(settings: &mut PdfSettings, field: &str, value: f64) {
+    let clamped = value.clamp(0.0, 2.0);
+    match field {
+        "top" => settings.margin_top_in = clamped,
+        "right" => settings.margin_right_in = clamped,
+        "bottom" => settings.margin_bottom_in = clamped,
+        "left" => settings.margin_left_in = clamped,
+        _ => {}
+    }
+}
+
+fn apply_pdf_template(
+    template: &str,
+    meta: &ReportMeta,
+    page: usize,
+    total_pages: usize,
+) -> String {
+    let mut rendered = template.to_string();
+    let page_str = page.to_string();
+    let total_pages_str = total_pages.to_string();
+    let replacements = [
+        ("{title}", meta.title.as_str()),
+        ("{site_address}", meta.site_address.as_str()),
+        ("{author}", meta.author.as_str()),
+        ("{date}", meta.date.as_str()),
+        ("{notes}", meta.notes.as_str()),
+        ("{page}", page_str.as_str()),
+        ("{total_pages}", total_pages_str.as_str()),
+    ];
+
+    for (token, value) in replacements {
+        rendered = rendered.replace(token, value);
+    }
+
+    html_escape(&rendered).replace('\n', "<br/>")
+}
+
 // ---------------------------------------------------------------------------
 // Browser helpers
 // ---------------------------------------------------------------------------
-
-fn trigger_download(filename: &str, bytes: &[u8], mime: &str) -> Result<(), String> {
-    let window = web_sys::window().ok_or("No browser window")?;
-    let document = window.document().ok_or("No document")?;
-    let anchor = document
-        .create_element("a")
-        .map_err(|_| "Failed to create anchor")?
-        .dyn_into::<HtmlAnchorElement>()
-        .map_err(|_| "Failed to cast anchor")?;
-
-    let array = Uint8Array::new_with_length(bytes.len() as u32);
-    array.copy_from(bytes);
-
-    let parts = Array::new();
-    parts.push(&array);
-
-    let opts = BlobPropertyBag::new();
-    opts.set_type(mime);
-    let blob = Blob::new_with_u8_array_sequence_and_options(&parts, &opts)
-        .map_err(|_| "Failed to create blob")?;
-    let url = Url::create_object_url_with_blob(&blob).map_err(|_| "Failed to create object URL")?;
-
-    anchor.set_href(&url);
-    anchor.set_download(filename);
-    let anchor_el: &HtmlElement = anchor.as_ref();
-    anchor_el.style().set_property("display", "none").ok();
-
-    if let Some(body) = document.body() {
-        body.append_child(&anchor).ok();
-        anchor.click();
-        body.remove_child(&anchor).ok();
-    } else {
-        anchor.click();
-    }
-
-    // Don't revoke the object URL immediately — the browser needs a moment
-    // to start the download after click(). Leaking a single blob URL per
-    // export is harmless; it will be GC'd when the page is unloaded.
-    Ok(())
-}
 
 fn html_escape(input: &str) -> String {
     input
@@ -269,8 +329,10 @@ fn export_filename(meta: &ReportMeta, ext: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Max pixel dimension for export-ready images.
-/// 2000px covers 200+ DPI at 1-up layout on 8.5×11 paper.
-const EXPORT_MAX_DIM: u32 = 2000;
+/// Tuned for PDF export quality without ballooning browser-generated PDFs.
+const MAX_PARALLEL_IMAGE_TASKS: usize = 6;
+const EXPORT_SIZE_STEPS: &[(u32, f64)] = &[(1600, 0.80), (1400, 0.74), (1200, 0.68), (1000, 0.62)];
+const EXPORT_TARGET_MAX_BYTES: usize = 400_000;
 
 /// Check if a file is HEIC/HEIF by MIME type or extension.
 /// Browsers (except Safari) typically report an empty MIME for HEIC files.
@@ -396,178 +458,116 @@ fn draw_scaled_data_url(
         .ok_or_else(|| "toDataURL returned non-string".to_string())
 }
 
-// ---------------------------------------------------------------------------
-// Excel export
-// ---------------------------------------------------------------------------
+fn decode_data_url_bytes(data_url: &str) -> Result<Vec<u8>, String> {
+    let (_, b64) = data_url
+        .split_once(',')
+        .ok_or_else(|| "data URL missing payload".to_string())?;
+    BASE64
+        .decode(b64)
+        .map_err(|_| "data URL base64 decode failed".to_string())
+}
 
-fn build_xlsx(
-    photos: &[PhotoItem],
-    layout: GridLayout,
-    meta: &ReportMeta,
-) -> Result<Vec<u8>, String> {
-    let mut workbook = Workbook::new();
+fn build_export_jpeg(bitmap: &ImageBitmap) -> Result<Vec<u8>, String> {
+    let mut best: Option<Vec<u8>> = None;
 
-    // -- optional cover / metadata sheet --------------------------------
-    let has_meta = !meta.title.is_empty()
-        || !meta.site_address.is_empty()
-        || !meta.author.is_empty()
-        || !meta.date.is_empty()
-        || !meta.notes.is_empty();
+    for (max_dim, quality) in EXPORT_SIZE_STEPS {
+        let data_url = draw_scaled_data_url(bitmap, *max_dim, *quality)?;
+        let bytes = decode_data_url_bytes(&data_url)?;
+        if bytes.len() <= EXPORT_TARGET_MAX_BYTES {
+            return Ok(bytes);
+        }
 
-    if has_meta {
-        let ws = workbook.add_worksheet();
-        ws.set_name("Report Info").map_err(|e| e.to_string())?;
-        ws.set_column_width_pixels(0, 160)
-            .map_err(|e| e.to_string())?;
-        ws.set_column_width_pixels(1, 500)
-            .map_err(|e| e.to_string())?;
-
-        let bold = Format::new().set_bold();
-        let mut r: u32 = 0;
-        let fields: &[(&str, &str)] = &[
-            ("Report Title", &meta.title),
-            ("Site / Address", &meta.site_address),
-            ("Prepared By", &meta.author),
-            ("Date", &meta.date),
-            ("Notes", &meta.notes),
-        ];
-        for (label, value) in fields {
-            if !value.is_empty() {
-                ws.write_string_with_format(r, 0, *label, &bold)
-                    .map_err(|e| e.to_string())?;
-                ws.write_string(r, 1, *value).map_err(|e| e.to_string())?;
-                r += 1;
-            }
+        let should_replace = best
+            .as_ref()
+            .map(|current| bytes.len() < current.len())
+            .unwrap_or(true);
+        if should_replace {
+            best = Some(bytes);
         }
     }
 
-    // -- photo pages ----------------------------------------------------
-    let cols = layout.cols();
+    best.ok_or_else(|| "failed to compress export image".to_string())
+}
 
-    for (page_idx, chunk) in photos.chunks(layout.page_size()).enumerate() {
-        let worksheet = workbook.add_worksheet();
-        worksheet
-            .set_name(format!("Page {}", page_idx + 1))
-            .map_err(|e| e.to_string())?;
+async fn build_photo_item(file: web_sys::File) -> Result<PhotoItem, String> {
+    let source_file = if is_heic(&file) {
+        convert_heic_to_jpeg(&file).await?
+    } else {
+        file
+    };
 
-        let bold = Format::new().set_bold();
-        let wrap = Format::new().set_text_wrap();
+    let filename = source_file.name();
+    let bitmap = create_bitmap(&source_file).await?;
+    let thumb_url = draw_scaled_data_url(&bitmap, 128, 0.7)?;
+    let preview_url = draw_scaled_data_url(&bitmap, 600, 0.8)?;
 
-        match layout {
-            GridLayout::OneUp | GridLayout::TwoUp => {
-                // Single column: image row, title row, description row per photo
-                worksheet
-                    .set_column_width_pixels(0, 500)
-                    .map_err(|e| e.to_string())?;
+    let id = next_photo_id();
+    // Store the source file for deferred export-JPEG generation at PDF time.
+    SOURCE_FILES.with(|m| m.borrow_mut().insert(id, source_file));
 
-                let mut r: u32 = 0;
-                for photo in chunk {
-                    // Image row
-                    worksheet
-                        .set_row_height_pixels(r, 340)
-                        .map_err(|e| e.to_string())?;
-                    let image = Image::new_from_buffer(&photo.bytes).map_err(|e| e.to_string())?;
-                    worksheet
-                        .insert_image_fit_to_cell(r, 0, &image, false)
-                        .map_err(|e| e.to_string())?;
-                    r += 1;
-
-                    // Title row
-                    worksheet
-                        .set_row_height_pixels(r, 24)
-                        .map_err(|e| e.to_string())?;
-                    worksheet
-                        .write_string_with_format(r, 0, &photo.title, &bold)
-                        .map_err(|e| e.to_string())?;
-                    r += 1;
-
-                    // Description row
-                    if !photo.description.is_empty() {
-                        let line_count = photo.description.lines().count().max(1) as u32;
-                        worksheet
-                            .set_row_height_pixels(r, 18 * line_count + 8)
-                            .map_err(|e| e.to_string())?;
-                        worksheet
-                            .write_string_with_format(r, 0, &photo.description, &wrap)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    r += 1;
-
-                    // Spacer
-                    r += 1;
-                }
-            }
-            GridLayout::TwoByTwo | GridLayout::TwoByThree => {
-                for col in 0..cols {
-                    worksheet
-                        .set_column_width_pixels(col as u16, 280)
-                        .map_err(|e| e.to_string())?;
-                }
-
-                // Each grid row: image row (180px), title row (22px), desc row (40px)
-                for row in 0..layout.rows() {
-                    let image_row = (row * 3) as u32;
-                    let title_row = image_row + 1;
-                    let desc_row = image_row + 2;
-                    worksheet
-                        .set_row_height_pixels(image_row, 180)
-                        .map_err(|e| e.to_string())?;
-                    worksheet
-                        .set_row_height_pixels(title_row, 22)
-                        .map_err(|e| e.to_string())?;
-                    worksheet
-                        .set_row_height_pixels(desc_row, 40)
-                        .map_err(|e| e.to_string())?;
-                }
-
-                for (slot_idx, photo) in chunk.iter().enumerate() {
-                    let row = slot_idx / cols;
-                    let col = slot_idx % cols;
-                    let image_row = (row * 3) as u32;
-                    let title_row = image_row + 1;
-                    let desc_row = image_row + 2;
-
-                    let image = Image::new_from_buffer(&photo.bytes).map_err(|e| e.to_string())?;
-                    worksheet
-                        .insert_image_fit_to_cell(image_row, col as u16, &image, false)
-                        .map_err(|e| e.to_string())?;
-                    worksheet
-                        .write_string_with_format(title_row, col as u16, &photo.title, &bold)
-                        .map_err(|e| e.to_string())?;
-                    if !photo.description.is_empty() {
-                        worksheet
-                            .write_string_with_format(
-                                desc_row,
-                                col as u16,
-                                &photo.description,
-                                &wrap,
-                            )
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
-            }
-        }
-    }
-
-    workbook.save_to_buffer().map_err(|e| e.to_string())
+    Ok(PhotoItem {
+        id,
+        title: title_from_filename(&filename),
+        description: String::new(),
+        filename,
+        mime: "image/jpeg".to_string(),
+        rotation_quadrants: 0,
+        thumb_url,
+        preview_url,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // PDF / print HTML export
 // ---------------------------------------------------------------------------
 
-fn build_print_html(photos: &[PhotoItem], layout: GridLayout, meta: &ReportMeta) -> String {
+fn build_print_html(
+    photos: &[PhotoItem],
+    export_bytes: &HashMap<u64, Vec<u8>>,
+    layout: GridLayout,
+    meta: &ReportMeta,
+    settings: &PdfSettings,
+    show_page_numbers: bool,
+    include_cover: bool,
+) -> String {
     let mut body_html = String::new();
+    let photo_pages = split_pages(photos, layout);
 
     // -- cover / metadata block -----------------------------------------
-    let has_meta = !meta.title.is_empty()
-        || !meta.site_address.is_empty()
-        || !meta.author.is_empty()
-        || !meta.date.is_empty()
-        || !meta.notes.is_empty();
+    let has_meta = include_cover
+        && (!meta.title.is_empty()
+            || !meta.site_address.is_empty()
+            || !meta.author.is_empty()
+            || !meta.date.is_empty()
+            || !meta.notes.is_empty()
+            || !meta.logo_data_url.is_empty());
+    let total_pages = photo_pages.len() + usize::from(has_meta);
 
     if has_meta {
+        let cover_page_number = 1;
+        let header_html = apply_pdf_template(
+            &settings.header_template,
+            meta,
+            cover_page_number,
+            total_pages,
+        );
+        let footer_html = apply_pdf_template(
+            &settings.footer_template,
+            meta,
+            cover_page_number,
+            total_pages,
+        );
         body_html.push_str(r#"<section class="page cover-page">"#);
+        if !header_html.trim().is_empty() {
+            body_html.push_str(&format!(r#"<div class="page-header">{header_html}</div>"#));
+        }
+        body_html.push_str(r#"<div class="page-main cover-main">"#);
+        if !meta.logo_data_url.is_empty() {
+            body_html.push_str(&format!(
+                r#"<div class="cover-logo"><img src="{}" alt="Logo" /></div>"#,
+                meta.logo_data_url
+            ));
+        }
         if !meta.title.is_empty() {
             body_html.push_str(&format!(
                 r#"<h1 class="cover-title">{}</h1>"#,
@@ -594,25 +594,42 @@ fn build_print_html(photos: &[PhotoItem], layout: GridLayout, meta: &ReportMeta)
                 html_escape(&meta.notes).replace('\n', "<br/>")
             ));
         }
+        body_html.push_str("</div>");
+        if !footer_html.trim().is_empty() {
+            body_html.push_str(&format!(r#"<div class="page-footer">{footer_html}</div>"#));
+        }
         body_html.push_str("</section>");
     }
 
     // -- photo pages ----------------------------------------------------
     match layout {
         GridLayout::OneUp | GridLayout::TwoUp => {
-            for (page_idx, page) in split_pages(photos, layout).iter().enumerate() {
-                body_html.push_str(&format!(
-                    r#"<section class="page"><div class="page-label">Page {}</div>"#,
-                    page_idx + 1
-                ));
-                for photo in page.iter().flatten() {
-                    let encoded = BASE64.encode(&photo.bytes);
+            for (page_idx, page) in photo_pages.iter().enumerate() {
+                let absolute_page = page_idx + 1 + usize::from(has_meta);
+                let header_html =
+                    apply_pdf_template(&settings.header_template, meta, absolute_page, total_pages);
+                let footer_html =
+                    apply_pdf_template(&settings.footer_template, meta, absolute_page, total_pages);
+                body_html.push_str(r#"<section class="page">"#);
+                if !header_html.trim().is_empty() {
+                    body_html.push_str(&format!(r#"<div class="page-header">{header_html}</div>"#));
+                }
+                if show_page_numbers {
                     body_html.push_str(&format!(
-                        r#"<div class="photo-block layout-{}"><img src="data:{};base64,{}" alt="{}" /><div class="caption"><strong>{}</strong>"#,
-                        layout.value(),
+                        r#"<div class="page-label">Page {}</div>"#,
+                        absolute_page
+                    ));
+                }
+                body_html.push_str(r#"<div class="page-main">"#);
+                for photo in page.iter().flatten() {
+                    let encoded = export_bytes.get(&photo.id).map(|b| BASE64.encode(b)).unwrap_or_default();
+                    let rotation_style = photo.rotation_style();
+                    body_html.push_str(&format!(
+                        r#"<div class="photo-block"><div class="photo-media"><img src="data:{};base64,{}" alt="{}" style="{}" /></div><div class="caption"><strong>{}</strong>"#,
                         photo.mime,
                         encoded,
                         html_escape(&photo.title),
+                        rotation_style,
                         html_escape(&photo.title),
                     ));
                     if !photo.description.is_empty() {
@@ -623,25 +640,45 @@ fn build_print_html(photos: &[PhotoItem], layout: GridLayout, meta: &ReportMeta)
                     }
                     body_html.push_str("</div></div>");
                 }
+                body_html.push_str("</div>"); // close .page-main
+                if !footer_html.trim().is_empty() {
+                    body_html.push_str(&format!(r#"<div class="page-footer">{footer_html}</div>"#));
+                }
                 body_html.push_str("</section>");
             }
         }
         GridLayout::TwoByTwo | GridLayout::TwoByThree => {
-            for (page_idx, page) in split_pages(photos, layout).iter().enumerate() {
+            for (page_idx, page) in photo_pages.iter().enumerate() {
+                let absolute_page = page_idx + 1 + usize::from(has_meta);
+                let header_html =
+                    apply_pdf_template(&settings.header_template, meta, absolute_page, total_pages);
+                let footer_html =
+                    apply_pdf_template(&settings.footer_template, meta, absolute_page, total_pages);
+                body_html.push_str(r#"<section class="page">"#);
+                if !header_html.trim().is_empty() {
+                    body_html.push_str(&format!(r#"<div class="page-header">{header_html}</div>"#));
+                }
+                if show_page_numbers {
+                    body_html.push_str(&format!(
+                        r#"<div class="page-label">Page {}</div>"#,
+                        absolute_page,
+                    ));
+                }
                 body_html.push_str(&format!(
-                    r#"<section class="page"><div class="page-label">Page {}</div><div class="grid rows-{}">"#,
-                    page_idx + 1,
+                    r#"<div class="page-main"><div class="grid rows-{}">"#,
                     layout.rows()
                 ));
                 for slot in page {
                     match slot {
                         Some(photo) => {
-                            let encoded = BASE64.encode(&photo.bytes);
+                            let encoded = export_bytes.get(&photo.id).map(|b| BASE64.encode(b)).unwrap_or_default();
+                            let rotation_style = photo.rotation_style();
                             body_html.push_str(&format!(
-                                r#"<figure class="cell"><img src="data:{};base64,{}" alt="{}" /><figcaption><strong>{}</strong>"#,
+                                r#"<figure class="cell"><div class="cell-media"><img src="data:{};base64,{}" alt="{}" style="{}" /></div><figcaption><strong>{}</strong>"#,
                                 photo.mime,
                                 encoded,
                                 html_escape(&photo.title),
+                                rotation_style,
                                 html_escape(&photo.title),
                             ));
                             if !photo.description.is_empty() {
@@ -659,7 +696,11 @@ fn build_print_html(photos: &[PhotoItem], layout: GridLayout, meta: &ReportMeta)
                         }
                     }
                 }
-                body_html.push_str("</div></section>");
+                body_html.push_str("</div></div>");
+                if !footer_html.trim().is_empty() {
+                    body_html.push_str(&format!(r#"<div class="page-footer">{footer_html}</div>"#));
+                }
+                body_html.push_str("</section>");
             }
         }
     }
@@ -679,52 +720,103 @@ fn build_print_html(photos: &[PhotoItem], layout: GridLayout, meta: &ReportMeta)
 <meta charset="utf-8" />
 <title>{title} — Gridora Forge Report</title>
 <style>
-* {{ box-sizing: border-box; }}
-body {{ margin: 0; font-family: Arial, sans-serif; color: #111; }}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+@page {{ size: letter; margin: 0; }}
+html, body {{ height: 100%; margin: 0; font-family: Arial, sans-serif; color: #111; background: #fff; }}
+
+/* Each .page is exactly one printed page.
+   Margins are baked in as padding so the browser print dialog cannot override them. */
 .page {{
-  width: 8.5in;
-  min-height: 11in;
-  padding: 0.5in;
+  width: 100%;
+  height: 100vh;
+  padding: {margin_top}in {margin_right}in {margin_bottom}in {margin_left}in;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   page-break-after: always;
 }}
 .page:last-child {{ page-break-after: auto; }}
-.cover-page {{ display: flex; flex-direction: column; justify-content: center; }}
+
+/* Optional header / footer chrome */
+.page-header,
+.page-footer {{
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: #666;
+  line-height: 1.35;
+}}
+.page-header {{ padding-bottom: 0.12in; }}
+.page-footer {{ padding-top: 0.12in; }}
+
+/* Main content area fills remaining page height */
+.page-main {{
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.12in;
+  min-height: 0;
+  overflow: hidden;
+}}
+
+/* ---------- Cover / title page ---------- */
+.cover-main {{
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+}}
+.cover-logo {{ margin-bottom: 0.25in; text-align: center; }}
+.cover-logo img {{ max-width: 3in; max-height: 1.5in; object-fit: contain; }}
 .cover-title {{ font-size: 28px; margin-bottom: 0.3in; }}
 .cover-detail {{ font-size: 14px; margin: 4px 0; }}
 .cover-notes {{ margin-top: 0.3in; font-size: 13px; }}
 .cover-notes p {{ margin: 6px 0 0 0; }}
-.page-label {{ margin-bottom: 0.15in; color: #555; font-size: 11px; }}
+
+/* ---------- Page number label ---------- */
+.page-label {{ flex: 0 0 auto; color: #555; font-size: 11px; }}
+
+/* ---------- Grid layouts (2×2, 2×3) ---------- */
 .grid {{
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 0.18in;
+  gap: 0.15in;
+  flex: 1 1 0;
+  min-height: 0;
 }}
-.grid.rows-2 .cell {{ height: 4.5in; }}
-.grid.rows-3 .cell {{ height: 2.9in; }}
+.grid.rows-2 {{ grid-template-rows: repeat(2, 1fr); }}
+.grid.rows-3 {{ grid-template-rows: repeat(3, 1fr); }}
 .cell {{
   border: 1px solid #ccc;
-  border-radius: 6px;
+  border-radius: 4px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
-}}
-figure {{ margin: 0; }}
-.cell img {{
-  width: 100%;
-  flex: 1 1 0;
-  object-fit: contain;
-  display: block;
   min-height: 0;
+}}
+figure {{ margin: 0; display: flex; flex-direction: column; min-height: 0; flex: 1 1 0; }}
+.cell-media {{
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
   background: #f5f5f5;
 }}
+.cell-media img {{
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+  object-fit: contain;
+  transform-origin: center center;
+}}
 .cell figcaption {{
-  padding: 4px 8px;
-  font-size: 11px;
+  flex: 0 0 auto;
+  padding: 3px 6px;
+  font-size: 10px;
   color: #333;
   line-height: 1.3;
   word-break: break-all;
   overflow-wrap: anywhere;
-  flex: 0 0 auto;
 }}
 .cell figcaption .desc {{ font-weight: normal; color: #555; }}
 .empty-cell {{
@@ -733,35 +825,45 @@ figure {{ margin: 0; }}
   background: #fafafa;
   color: #999;
 }}
+
+/* ---------- Stacked layouts (1-up, 2-up) ---------- */
 .photo-block {{
-  margin-bottom: 0.25in;
   border: 1px solid #ddd;
-  border-radius: 6px;
+  border-radius: 4px;
   overflow: hidden;
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }}
-.photo-block.layout-1up img {{
-  width: 100%;
-  max-height: 7in;
-  object-fit: contain;
-  display: block;
+.photo-media {{
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
   background: #f5f5f5;
 }}
-.photo-block.layout-2up img {{
-  width: 100%;
-  max-height: 3.5in;
-  object-fit: contain;
+.photo-media img {{
+  max-width: 100%;
+  max-height: 100%;
   display: block;
-  background: #f5f5f5;
+  object-fit: contain;
+  transform-origin: center center;
 }}
 .caption {{
-  padding: 8px 10px;
+  flex: 0 0 auto;
+  padding: 6px 8px;
   font-size: 12px;
   line-height: 1.4;
   word-break: break-all;
   overflow-wrap: anywhere;
 }}
-.caption p {{ margin: 4px 0 0 0; color: #444; word-break: break-all; overflow-wrap: anywhere; }}
+.caption p {{ margin: 4px 0 0 0; color: #444; }}
+
 @media print {{
+  html, body {{ height: 100%; }}
   body {{ print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
   .page {{ page-break-inside: avoid; }}
 }}
@@ -770,12 +872,15 @@ figure {{ margin: 0; }}
 <body>
 {body}
 <script>
-// Wait for all base64 images to decode before opening print dialog
 window.onload = function() {{ window.print(); }};
 </script>
 </body>
 </html>"#,
         title = title_esc,
+    margin_top = settings.margin_top_in,
+    margin_right = settings.margin_right_in,
+    margin_bottom = settings.margin_bottom_in,
+    margin_left = settings.margin_left_in,
         body = body_html
     )
 }
@@ -788,10 +893,26 @@ window.onload = function() {{ window.print(); }};
 fn App() -> impl IntoView {
     let photos = RwSignal::new(Vec::<PhotoItem>::new());
     let layout = RwSignal::new(GridLayout::TwoByTwo);
-    let meta = RwSignal::new(ReportMeta::default());
-    let status = RwSignal::new(String::from(
-        "Ready \u{2014} drop images here or click \u{201c}Add Photos\u{201d} to start.",
-    ));
+    // Get today's date in YYYY-MM-DD for the default
+    let today = {
+        let d = js_sys::Date::new_0();
+        let y = d.get_full_year();
+        let m = d.get_month() + 1; // 0-indexed
+        let day = d.get_date();
+        format!("{y:04}-{m:02}-{day:02}")
+    };
+    let meta = RwSignal::new(ReportMeta {
+        title: "Report Title".to_string(),
+        site_address: "123 Site Address, 12345 ST".to_string(),
+        author: "The Author".to_string(),
+        date: today,
+        notes: "Photos and descriptions of 123 Site Address, 12345 ST".to_string(),
+        logo_data_url: String::new(),
+    });
+    let pdf_settings = RwSignal::new(PdfSettings::default());
+    let include_page_numbers = RwSignal::new(false);
+    let enable_cover_page = RwSignal::new(false);
+    let status = RwSignal::new(String::new());
     let drag_idx = RwSignal::new(Option::<usize>::None);
     let drop_indicator = RwSignal::new(Option::<usize>::None);
     let photo_positions: Memo<HashMap<u64, usize>> = Memo::new(move |_| {
@@ -800,15 +921,25 @@ fn App() -> impl IntoView {
     let clear_pending = RwSignal::new(false);
     let loading = RwSignal::new(false);
     let drop_hover = RwSignal::new(false);
+    let show_support_modal = RwSignal::new(false);
     let progress = RwSignal::new((0usize, 0usize)); // (current, total)
     let preview_page = RwSignal::new(0usize);
+    let has_cover_page: Memo<bool> = Memo::new(move |_| {
+        if !enable_cover_page.get() {
+            return false;
+        }
+        let m = meta.get();
+        !m.title.is_empty() || !m.site_address.is_empty() || !m.author.is_empty()
+            || !m.date.is_empty() || !m.notes.is_empty() || !m.logo_data_url.is_empty()
+    });
     let total_pages: Memo<usize> = Memo::new(move |_| {
         let count = photos.with(|v| v.len());
         let ps = layout.get().page_size();
+        let cover = usize::from(has_cover_page.get());
         if count == 0 {
-            1
+            1 + cover
         } else {
-            count.div_ceil(ps)
+            count.div_ceil(ps) + cover
         }
     });
     // Auto-clamped page index: always valid even when photos/layout shrink
@@ -861,87 +992,57 @@ fn App() -> impl IntoView {
         }
         loading.set(true);
         progress.set((0, raw_files.len()));
+        status.set(format!(
+            "Processing {} image(s) with {} parallel worker(s)…",
+            raw_files.len(),
+            raw_files.len().min(MAX_PARALLEL_IMAGE_TASKS)
+        ));
 
         spawn_local(async move {
-            let mut loaded = Vec::new();
             let total = raw_files.len();
+            let completed = Rc::new(Cell::new(0usize));
+            let mut loaded = Vec::<(usize, PhotoItem)>::new();
+            let mut skipped = 0usize;
+            let mut work = stream::iter(raw_files.into_iter().enumerate().map(|(idx, file)| {
+                let completed = completed.clone();
+                async move {
+                    let file_name = file.name();
+                    let result = build_photo_item(file).await;
+                    let done = completed.get() + 1;
+                    completed.set(done);
+                    (idx, file_name, done, result)
+                }
+            }))
+            .buffer_unordered(MAX_PARALLEL_IMAGE_TASKS);
 
-            for (idx, file) in raw_files.into_iter().enumerate() {
-                let fname = file.name();
-                progress.set((idx + 1, total));
-                status.set(format!("Processing {}/{}: {}", idx + 1, total, &fname));
-
-                // Convert HEIC/HEIF to JPEG before processing
-                let file = if is_heic(&file) {
-                    status.set(format!("Converting HEIC {}/{}: {}", idx + 1, total, &fname));
-                    match convert_heic_to_jpeg(&file).await {
-                        Ok(converted) => converted,
-                        Err(e) => {
-                            web_sys::console::warn_1(
-                                &format!("HEIC conversion failed for {}: {}", fname, e).into(),
-                            );
-                            continue;
-                        }
+            while let Some((idx, file_name, done, result)) = work.next().await {
+                progress.set((done, total));
+                match result {
+                    Ok(photo) => {
+                        loaded.push((idx, photo));
+                        status.set(format!("Processed {done}/{total}: {file_name}"));
                     }
-                } else {
-                    file
-                };
-
-                // Decode the image once; derive thumbnail, preview, and export
-                // bytes from the same ImageBitmap to avoid repeated full-res decodes.
-                let bitmap = match create_bitmap(&file).await {
-                    Ok(b) => b,
-                    Err(e) => {
+                    Err(err) => {
+                        skipped += 1;
                         web_sys::console::warn_1(
-                            &format!("Image decode failed for {}: {}", fname, e).into(),
+                            &format!("Image processing failed for {}: {}", file_name, err).into(),
                         );
-                        continue;
+                        status.set(format!("Skipped {done}/{total}: {file_name}"));
                     }
-                };
-
-                let thumb_url = draw_scaled_data_url(&bitmap, 128, 0.7).unwrap_or_default();
-                let preview_url = draw_scaled_data_url(&bitmap, 600, 0.8).unwrap_or_default();
-
-                let export_url = draw_scaled_data_url(&bitmap, EXPORT_MAX_DIM, 0.85);
-                let (bytes, mime) = if let Ok(ref data_url) = export_url {
-                    if let Some((_, b64)) = data_url.split_once(',') {
-                        match BASE64.decode(b64) {
-                            Ok(b) => (b, "image/jpeg".to_string()),
-                            Err(_) => {
-                                match read_as_bytes(&gloo_file::File::from(file.clone())).await {
-                                    Ok(raw) => (raw, file.type_()),
-                                    Err(_) => continue,
-                                }
-                            }
-                        }
-                    } else {
-                        match read_as_bytes(&gloo_file::File::from(file.clone())).await {
-                            Ok(raw) => (raw, file.type_()),
-                            Err(_) => continue,
-                        }
-                    }
-                } else {
-                    match read_as_bytes(&gloo_file::File::from(file.clone())).await {
-                        Ok(raw) => (raw, file.type_()),
-                        Err(_) => continue,
-                    }
-                };
-
-                loaded.push(PhotoItem {
-                    id: next_photo_id(),
-                    title: title_from_filename(&fname),
-                    description: String::new(),
-                    filename: fname,
-                    mime,
-                    thumb_url,
-                    preview_url,
-                    bytes: bytes.into(),
-                });
+                }
             }
 
+            loaded.sort_by_key(|(idx, _)| *idx);
             let loaded_count = loaded.len();
-            photos.update(|items| items.extend(loaded));
-            status.set(format!("Loaded {} image(s).", loaded_count));
+            photos.update(|items| items.extend(loaded.into_iter().map(|(_, photo)| photo)));
+            if skipped == 0 {
+                status.set(format!("Loaded {} image(s).", loaded_count));
+            } else {
+                status.set(format!(
+                    "Loaded {} image(s); skipped {} file(s).",
+                    loaded_count, skipped
+                ));
+            }
             loading.set(false);
             progress.set((0, 0));
         });
@@ -986,53 +1087,6 @@ fn App() -> impl IntoView {
         }
     };
 
-    // --- export handlers -----------------------------------------------
-    let export_xlsx = move |_| {
-        if loading.get() {
-            return;
-        }
-        let current = photos.get();
-        if current.is_empty() {
-            status.set("Add photos before exporting.".to_string());
-            return;
-        }
-
-        loading.set(true);
-        status.set("Generating Excel\u{2026}".to_string());
-
-        // Run in spawn_local so the status message has a chance to paint,
-        // and so any WASM panic gets surfaced via console_error_panic_hook
-        // instead of silently aborting the synchronous closure.
-        let layout_val = layout.get();
-        let m = meta.get();
-        let status_signal = status;
-        spawn_local(async move {
-            let result = build_xlsx(&current, layout_val, &m);
-            match result {
-                Ok(bytes) => {
-                    web_sys::console::log_1(
-                        &format!("xlsx generated: {} bytes", bytes.len()).into(),
-                    );
-                    let fname = export_filename(&m, "xlsx");
-                    if let Err(err) = trigger_download(
-                        &fname,
-                        &bytes,
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    ) {
-                        status_signal.set(format!("Excel export failed: {err}"));
-                    } else {
-                        status_signal.set("Excel file downloaded.".to_string());
-                    }
-                }
-                Err(err) => {
-                    web_sys::console::error_1(&format!("xlsx build error: {err}").into());
-                    status_signal.set(format!("Excel export failed: {err}"));
-                }
-            }
-            loading.set(false);
-        });
-    };
-
     let export_pdf = move |_| {
         if loading.get() {
             return;
@@ -1044,40 +1098,85 @@ fn App() -> impl IntoView {
         }
 
         let m = meta.get();
-        let html = build_print_html(&current, layout.get(), &m);
+        let ly = layout.get();
+        let settings = pdf_settings.get();
+        let show_page_numbers = include_page_numbers.get();
+        let include_cover = enable_cover_page.get();
+
+        // The popup must be opened synchronously (same user-gesture tick)
+        // to avoid browser popup-blockers.
         let Some(window) = web_sys::window() else {
             status.set("Could not access the browser window.".to_string());
             return;
         };
+        let print_window = match window.open_with_url_and_target("about:blank", "_blank") {
+            Ok(Some(w)) => w,
+            _ => {
+                status.set("Popup was blocked. Allow popups for this app and try again.".to_string());
+                return;
+            }
+        };
 
-        match window.open_with_url_and_target("about:blank", "_blank") {
-            Ok(Some(print_window)) => {
-                if let Some(doc) = print_window.document() {
-                    let html_doc: HtmlDocument = doc.unchecked_into();
-                    let _ = html_doc.open();
-                    let _ = html_doc.write(&js_sys::Array::of1(&html.into()));
-                    let _ = html_doc.close();
-                    // Don't call print_window.print() here — the <script> in
-                    // the written HTML will call window.print() after onload,
-                    // ensuring all base64 images have been decoded.
-                    status.set(
-                        "Print dialog opened. Choose \u{201c}Save as PDF\u{201d} in the browser print dialog."
-                            .to_string(),
-                    );
-                } else {
-                    status.set("Could not open print document.".to_string());
+        status.set("Preparing PDF\u{2026} compressing images".to_string());
+        loading.set(true);
+
+        spawn_local(async move {
+            // Build export JPEG bytes for each photo from the stored source files.
+            let mut export_bytes = HashMap::new();
+            for photo in &current {
+                let file_opt = SOURCE_FILES.with(|m| m.borrow().get(&photo.id).cloned());
+                if let Some(file) = file_opt {
+                    match create_bitmap(&file).await {
+                        Ok(bitmap) => match build_export_jpeg(&bitmap) {
+                            Ok(bytes) => { export_bytes.insert(photo.id, bytes); }
+                            Err(e) => {
+                                web_sys::console::warn_1(&format!("Export JPEG failed for {}: {}", photo.filename, e).into());
+                            }
+                        },
+                        Err(e) => {
+                            web_sys::console::warn_1(&format!("Bitmap decode failed for {}: {}", photo.filename, e).into());
+                        }
+                    }
                 }
             }
-            _ => status
-                .set("Popup was blocked. Allow popups for this app and try again.".to_string()),
-        }
+
+            let html = build_print_html(&current, &export_bytes, ly, &m, &settings, show_page_numbers, include_cover);
+
+            if let Some(doc) = print_window.document() {
+                let html_doc: HtmlDocument = doc.unchecked_into();
+                let _ = html_doc.open();
+                let _ = html_doc.write(&js_sys::Array::of1(&html.into()));
+                let _ = html_doc.close();
+                status.set(
+                    "Print dialog opened. Choose \u{201c}Save as PDF\u{201d} in the browser print dialog."
+                        .to_string(),
+                );
+            } else {
+                let _ = print_window.close();
+                status.set("Could not open print document.".to_string());
+            }
+            loading.set(false);
+
+            // Show support modal after export completes (unless permanently dismissed)
+            let dominated = web_sys::window()
+                .unwrap()
+                .local_storage()
+                .ok()
+                .flatten()
+                .and_then(|s| s.get_item("gridora_support_dismissed").ok().flatten())
+                .unwrap_or_default()
+                == "1";
+            if !dominated {
+                // Small delay so it appears after the print dialog opens
+                gloo_timers::future::TimeoutFuture::new(600).await;
+                show_support_modal.set(true);
+            }
+        });
     };
 
-    // --- folder input ref (for webkitdirectory) -------------------------
-    let folder_ref = NodeRef::<leptos::html::Input>::new();
+    // --- input refs -------------------------------------------------------
     let file_input_ref = NodeRef::<leptos::html::Input>::new();
-    let xlsx_btn_ref = NodeRef::<leptos::html::Button>::new();
-    let pdf_btn_ref = NodeRef::<leptos::html::Button>::new();
+    let folder_ref = NodeRef::<leptos::html::Input>::new();
     Effect::new(move |_| {
         if let Some(el) = folder_ref.get() {
             let _ = el.set_attribute("webkitdirectory", "");
@@ -1085,7 +1184,7 @@ fn App() -> impl IntoView {
     });
 
     // --- keyboard shortcuts (one-time setup) ---------------------------
-    // Ctrl+O = add files, Ctrl+E = export xlsx, Ctrl+P = print/pdf
+    // Ctrl+O = add files  (Ctrl+P intentionally NOT bound — conflicts with browser print)
     {
         use wasm_bindgen::closure::Closure;
         let window = web_sys::window().unwrap();
@@ -1095,26 +1194,11 @@ fn App() -> impl IntoView {
                 if !ctrl {
                     return;
                 }
-                match ev.key().as_str() {
-                    "o" | "O" => {
-                        ev.prevent_default();
-                        if let Some(el) = file_input_ref.get() {
-                            el.click();
-                        }
+                if ev.key() == "o" || ev.key() == "O" {
+                    ev.prevent_default();
+                    if let Some(el) = file_input_ref.get() {
+                        el.click();
                     }
-                    "e" | "E" => {
-                        ev.prevent_default();
-                        if let Some(el) = xlsx_btn_ref.get() {
-                            el.click();
-                        }
-                    }
-                    "p" | "P" => {
-                        ev.prevent_default();
-                        if let Some(el) = pdf_btn_ref.get() {
-                            el.click();
-                        }
-                    }
-                    _ => {}
                 }
             });
         window
@@ -1196,9 +1280,11 @@ fn App() -> impl IntoView {
         <div class="app">
             <header class="toolbar">
                 <span class="brand">"Gridora Forge"</span>
-                <div class="toolbar-group">
+                <span class="version-badge">"v1.0.0"</span>
+                <span class="toolbar-hint">"Drag. Drop. Label. Export to PDF."</span>
+                <div class="toolbar-group toolbar-left">
                     <label class="btn btn-primary">
-                        "\u{1F4F7} Add Photos"
+                        "\u{1F4F7} Photos"
                         <input type="file" multiple accept="image/*,.heic,.heif" node_ref=file_input_ref on:change=on_files />
                     </label>
                     <label class="btn btn-secondary">
@@ -1254,12 +1340,13 @@ fn App() -> impl IntoView {
                         </button>
                     </div>
                     <span class="toolbar-sep">"|"</span>
-                    <button class="btn-export" node_ref=xlsx_btn_ref on:click=export_xlsx disabled=move || loading.get()>"\u{1F4CA} Excel"</button>
-                    <button class="btn-export" node_ref=pdf_btn_ref on:click=export_pdf disabled=move || loading.get()>"\u{1F5A8} PDF"</button>
+                    <button class="btn-export" on:click=export_pdf disabled=move || loading.get()>"\u{1F5A8} Export to PDF"</button>
+                    <span class="toolbar-sep">"|"</span>
                     <button
                         class=move || if clear_pending.get() { "btn-danger btn-confirm" } else { "btn-danger" }
                         on:click=move |_| {
                             if clear_pending.get() {
+                                SOURCE_FILES.with(|m| m.borrow_mut().clear());
                                 photos.set(Vec::new());
                                 status.set("Cleared all photos.".to_string());
                                 clear_pending.set(false);
@@ -1280,6 +1367,11 @@ fn App() -> impl IntoView {
                         }
                     >{move || if clear_pending.get() { "Confirm?" } else { "Clear" }}</button>
                 </div>
+                <div class="toolbar-right">
+                    <a class="btn btn-secondary toolbar-link" href="https://github.com/RCSnyder/gridora-forge" target="_blank" rel="noreferrer">"\u{1F4BB} Source"</a>
+                    <a class="btn btn-secondary toolbar-link" href="https://github.com/RCSnyder/gridora-forge/issues/new" target="_blank" rel="noreferrer">"\u{1F41B} Report a Problem / Request a Feature"</a>
+                    <a class="btn btn-secondary toolbar-link" href="https://buymeacoffee.com/rcoopersnyder" target="_blank" rel="noreferrer">"\u{2615} Support"</a>
+                </div>
             </header>
             <div class=move || {
                 let s = status.get();
@@ -1289,6 +1381,8 @@ fn App() -> impl IntoView {
                     "status-bar status-progress"
                 } else if s.contains("downloaded") || s.contains("Loaded") || s.contains("Cleared") {
                     "status-bar status-success"
+                } else if s.is_empty() {
+                    "status-bar status-hidden"
                 } else {
                     "status-bar"
                 }
@@ -1336,8 +1430,19 @@ fn App() -> impl IntoView {
                     }
                 >
                     <details class="meta-panel">
-                        <summary>"Report Info"</summary>
+                        <summary>"Title Page & Report Info"</summary>
                         <div class="meta-grid">
+                            <label class="checkbox-field">
+                                <input
+                                    type="checkbox"
+                                    prop:checked=move || enable_cover_page.get()
+                                    on:change=move |ev| {
+                                        let checked = event_target::<HtmlInputElement>(&ev).checked();
+                                        enable_cover_page.set(checked);
+                                    }
+                                />
+                                <span>"Include title page"</span>
+                            </label>
                             <label class="meta-field">
                                 <span>"Title"</span>
                                 <input
@@ -1401,8 +1506,164 @@ fn App() -> impl IntoView {
                                     }
                                 ></textarea>
                             </label>
+                            <div class="meta-field full-width logo-field">
+                                <span>"Logo"</span>
+                                <div class="logo-row">
+                                    {move || {
+                                        let url = meta.get().logo_data_url.clone();
+                                        if url.is_empty() {
+                                            None
+                                        } else {
+                                            Some(view! { <img class="logo-preview" src=url alt="Logo" /> })
+                                        }
+                                    }}
+                                    <label class="btn btn-secondary logo-btn">
+                                        {move || if meta.get().logo_data_url.is_empty() { "Upload Logo" } else { "Replace" }}
+                                        <input
+                                            type="file"
+                                            accept="image/*"
+                                            on:change=move |ev| {
+                                                let input = event_target::<HtmlInputElement>(&ev);
+                                                if let Some(files) = input.files() {
+                                                    if let Some(file) = files.get(0) {
+                                                        let meta = meta;
+                                                        spawn_local(async move {
+                                                            if let Ok(bitmap) = create_bitmap(&file).await {
+                                                                if let Ok(url) = draw_scaled_data_url(&bitmap, 400, 0.85) {
+                                                                    meta.update(|m| m.logo_data_url = url);
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                                // Reset so re-selecting same file fires change
+                                                input.set_value("");
+                                            }
+                                        />
+                                    </label>
+                                    <Show when=move || !meta.get().logo_data_url.is_empty()>
+                                        <button class="btn-danger btn-sm" on:click=move |_| {
+                                            meta.update(|m| m.logo_data_url.clear());
+                                        }>"Remove"</button>
+                                    </Show>
+                                </div>
+                            </div>
                         </div>
                     </details>
+
+                    <details class="meta-panel">
+                        <summary>"PDF Export Settings"</summary>
+                        <div class="meta-grid pdf-grid">
+                            <label class="meta-field">
+                                <span>"Top Margin (in)"</span>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    max="2"
+                                    step="0.05"
+                                    prop:value=move || format!("{:.2}", pdf_settings.get().margin_top_in)
+                                    on:input=move |ev| {
+                                        let value = event_target::<HtmlInputElement>(&ev)
+                                            .value()
+                                            .parse::<f64>()
+                                            .unwrap_or_default();
+                                        pdf_settings.update(|settings| update_pdf_margin(settings, "top", value));
+                                    }
+                                />
+                            </label>
+                            <label class="meta-field">
+                                <span>"Right Margin (in)"</span>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    max="2"
+                                    step="0.05"
+                                    prop:value=move || format!("{:.2}", pdf_settings.get().margin_right_in)
+                                    on:input=move |ev| {
+                                        let value = event_target::<HtmlInputElement>(&ev)
+                                            .value()
+                                            .parse::<f64>()
+                                            .unwrap_or_default();
+                                        pdf_settings.update(|settings| update_pdf_margin(settings, "right", value));
+                                    }
+                                />
+                            </label>
+                            <label class="meta-field">
+                                <span>"Bottom Margin (in)"</span>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    max="2"
+                                    step="0.05"
+                                    prop:value=move || format!("{:.2}", pdf_settings.get().margin_bottom_in)
+                                    on:input=move |ev| {
+                                        let value = event_target::<HtmlInputElement>(&ev)
+                                            .value()
+                                            .parse::<f64>()
+                                            .unwrap_or_default();
+                                        pdf_settings.update(|settings| update_pdf_margin(settings, "bottom", value));
+                                    }
+                                />
+                            </label>
+                            <label class="meta-field">
+                                <span>"Left Margin (in)"</span>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    max="2"
+                                    step="0.05"
+                                    prop:value=move || format!("{:.2}", pdf_settings.get().margin_left_in)
+                                    on:input=move |ev| {
+                                        let value = event_target::<HtmlInputElement>(&ev)
+                                            .value()
+                                            .parse::<f64>()
+                                            .unwrap_or_default();
+                                        pdf_settings.update(|settings| update_pdf_margin(settings, "left", value));
+                                    }
+                                />
+                            </label>
+                            <label class="meta-field full-width">
+                                <span>"Header"</span>
+                                <textarea
+                                    rows="2"
+                                    placeholder="{title}"
+                                    prop:value=move || pdf_settings.get().header_template.clone()
+                                    on:input=move |ev| {
+                                        let v = event_target::<HtmlTextAreaElement>(&ev).value();
+                                        pdf_settings.update(|settings| settings.header_template = v);
+                                    }
+                                ></textarea>
+                            </label>
+                            <label class="meta-field full-width">
+                                <span>"Footer"</span>
+                                <textarea
+                                    rows="2"
+                                    placeholder="Page {page} of {total_pages}"
+                                    prop:value=move || pdf_settings.get().footer_template.clone()
+                                    on:input=move |ev| {
+                                        let v = event_target::<HtmlTextAreaElement>(&ev).value();
+                                        pdf_settings.update(|settings| settings.footer_template = v);
+                                    }
+                                ></textarea>
+                            </label>
+                            <div class="token-hint full-width">
+                                "Tokens: {title}, {site_address}, {author}, {date}, {notes}, {page}, {total_pages}"
+                            </div>
+                            <label class="meta-field full-width checkbox-field">
+                                <input
+                                    type="checkbox"
+                                    prop:checked=move || include_page_numbers.get()
+                                    on:change=move |ev| {
+                                        let checked = event_target::<HtmlInputElement>(&ev).checked();
+                                        include_page_numbers.set(checked);
+                                    }
+                                />
+                                <span>"Include page numbers"</span>
+                            </label>
+                        </div>
+                    </details>
+
+
 
                     <div class="section-bar">
                         <span class="section-label">"Photos"</span>
@@ -1413,6 +1674,10 @@ fn App() -> impl IntoView {
                         when=move || !photos.with(|v| v.is_empty())
                         fallback=move || view! {
                             <label class="empty-drop-zone">
+                                <span class="drop-zone-title">"Free Construction Photo Report Generator"</span>
+                                <span class="drop-zone-steps">"Drag. Drop. Label. Export to PDF."</span>
+                                <span class="drop-zone-privacy">"No Installs \u{00B7} No Uploads \u{00B7} 100% Private in Browser"</span>
+                                <span class="drop-zone-divider" />
                                 <span class="drop-zone-icon">"\u{1F4F7}"</span>
                                 <span class="drop-zone-text">"Drop images here, or click to browse"</span>
                                 <input type="file" multiple accept="image/*,.heic,.heif" on:change=on_files />
@@ -1500,6 +1765,7 @@ fn App() -> impl IntoView {
                                     let remove = {
                                         let photos = photos;
                                         move |_| {
+                                            SOURCE_FILES.with(|m| { m.borrow_mut().remove(&photo_id); });
                                             photos.update(|items| items.retain(|i| i.id != photo_id));
                                         }
                                     };
@@ -1576,12 +1842,32 @@ fn App() -> impl IntoView {
                                             }
                                         >
                                             <div class="thumb">
-                                                <img src=photo.thumb_url.clone() alt=photo.title.clone() loading="lazy" />
+                                                <img
+                                                    src=photo.thumb_url.clone()
+                                                    alt=photo.title.clone()
+                                                    loading="lazy"
+                                                    style=photo.rotation_style()
+                                                />
                                             </div>
                                             <div class="row-body">
                                                 <div class="row-top">
                                                     <span class="row-idx">{move || format!("#{}", idx() + 1)}</span>
+                                                    <span class="row-file" title=photo.filename.clone()>{photo.filename.clone()}</span>
                                                     <div class="row-actions">
+                                                        <button
+                                                            on:click=move |_| {
+                                                                photos.update(|items| rotate_photo(items, photo_id, -1));
+                                                            }
+                                                            aria-label="Rotate counterclockwise"
+                                                            title="Rotate counterclockwise"
+                                                        >"\u{21BA}"</button>
+                                                        <button
+                                                            on:click=move |_| {
+                                                                photos.update(|items| rotate_photo(items, photo_id, 1));
+                                                            }
+                                                            aria-label="Rotate clockwise"
+                                                            title="Rotate clockwise"
+                                                        >"\u{21BB}"</button>
                                                         <button on:click=move_up disabled=move || idx() == 0 aria-label="Move up">"\u{25B2}"</button>
                                                         <button on:click=move_down disabled=is_last aria-label="Move down">"\u{25BC}"</button>
                                                         <button class="btn-danger" on:click=remove aria-label="Remove">"\u{2715}"</button>
@@ -1596,11 +1882,7 @@ fn App() -> impl IntoView {
                                                     on:blur=move |_| row_focused.set(false)
                                                     on:input=move |ev| {
                                                         let v = event_target::<HtmlInputElement>(&ev).value();
-                                                        photos.update(|items| {
-                                                            if let Some(item) = items.iter_mut().find(|i| i.id == photo_id) {
-                                                                item.title = v;
-                                                            }
-                                                        });
+                                                        photos.update(|items| update_photo_title(items, photo_id, v));
                                                     }
                                                 />
                                                 <textarea
@@ -1616,11 +1898,7 @@ fn App() -> impl IntoView {
                                                         let _ = style.set_property("height", "auto");
                                                         let _ = style.set_property("height", &format!("{}px", el.scroll_height()));
                                                         let v = el.value();
-                                                        photos.update(|items| {
-                                                            if let Some(item) = items.iter_mut().find(|i| i.id == photo_id) {
-                                                                item.description = v;
-                                                            }
-                                                        });
+                                                        photos.update(|items| update_photo_description(items, photo_id, v));
                                                     }
                                                 ></textarea>
                                             </div>
@@ -1654,7 +1932,15 @@ fn App() -> impl IntoView {
                                 disabled=move || clamped_page.get() == 0
                             >"\u{25C0}"</button>
                             <span class="page-nav-label">
-                                {move || format!("Page {} / {}", clamped_page.get() + 1, total_pages.get())}
+                                {move || {
+                                    let p = clamped_page.get();
+                                    let t = total_pages.get();
+                                    if has_cover_page.get() && p == 0 {
+                                        format!("Title Page \u{2014} 1 / {t}")
+                                    } else {
+                                        format!("Page {} / {t}", p + 1)
+                                    }
+                                }}
                             </span>
                             <button class="page-nav-btn"
                                 on:click=move |_| {
@@ -1672,14 +1958,62 @@ fn App() -> impl IntoView {
                         </div>
                     </div>
                     {move || {
+                        let has_cover = has_cover_page.get();
+                        let page_idx = clamped_page.get();
+
+                        // --- Cover page preview ---
+                        if has_cover && page_idx == 0 {
+                            let m = meta.get();
+                            let logo = m.logo_data_url.clone();
+                            return view! {
+                                <div class="page-card cover-preview">
+                                    <div class="page-label">"TITLE PAGE"</div>
+                                    <div class="cover-preview-content">
+                                        {if !logo.is_empty() {
+                                            Some(view! { <img class="cover-preview-logo" src=logo alt="Logo" /> })
+                                        } else {
+                                            None
+                                        }}
+                                        {if !m.title.is_empty() {
+                                            Some(view! { <h2 class="cover-preview-title">{m.title.clone()}</h2> })
+                                        } else {
+                                            None
+                                        }}
+                                        {if !m.site_address.is_empty() {
+                                            Some(view! { <p class="cover-preview-detail"><strong>"Site / Address: "</strong>{m.site_address.clone()}</p> })
+                                        } else {
+                                            None
+                                        }}
+                                        {if !m.author.is_empty() {
+                                            Some(view! { <p class="cover-preview-detail"><strong>"Prepared By: "</strong>{m.author.clone()}</p> })
+                                        } else {
+                                            None
+                                        }}
+                                        {if !m.date.is_empty() {
+                                            Some(view! { <p class="cover-preview-detail"><strong>"Date: "</strong>{m.date.clone()}</p> })
+                                        } else {
+                                            None
+                                        }}
+                                        {if !m.notes.is_empty() {
+                                            Some(view! { <div class="cover-preview-notes"><strong>"Notes: "</strong><p>{m.notes.clone()}</p></div> })
+                                        } else {
+                                            None
+                                        }}
+                                    </div>
+                                </div>
+                            }.into_any();
+                        }
+
+                        // --- Photo page preview ---
                         let ly = layout.get();
                         let page_size = ly.page_size();
                         let num_cols = ly.cols();
                         let cols_class = if num_cols == 1 { "cols-1" } else { "cols-2" };
-                        let page_idx = clamped_page.get();
+                        // Offset page index by cover page
+                        let photo_page_idx = if has_cover { page_idx - 1 } else { page_idx };
                         // Borrow photos — only clone the single page we need
                         let (page, item_count) = photos.with(|items| {
-                            let start = page_idx * page_size;
+                            let start = photo_page_idx * page_size;
                             let mut pg = Vec::with_capacity(page_size);
                             for s in 0..page_size {
                                 if start + s < items.len() {
@@ -1692,12 +2026,13 @@ fn App() -> impl IntoView {
                         });
 
                         let slots = page.into_iter().enumerate().map(|(slot_idx, slot)| {
-                            let flat_idx = page_idx * page_size + slot_idx;
+                            let flat_idx = photo_page_idx * page_size + slot_idx;
                                     match slot {
                                         Some(photo) => {
                                             let title = photo.title.clone();
                                             let desc = photo.description.clone();
                                             let has_desc = !desc.is_empty();
+                                            let rotation_style = photo.rotation_style();
                                             view! {
                                                 <div
                                                     draggable="true"
@@ -1771,7 +2106,14 @@ fn App() -> impl IntoView {
                                                         drop_indicator.set(None);
                                                     }
                                                 >
-                                                    <img src=photo.preview_url alt=title.clone() loading="lazy" />
+                                                    <div class="slot-media">
+                                                        <img
+                                                            src=photo.preview_url
+                                                            alt=title.clone()
+                                                            loading="lazy"
+                                                            style=rotation_style
+                                                        />
+                                                    </div>
                                                     <div class="slot-info">
                                                         <strong class="slot-title">{title}</strong>
                                                         {if has_desc {
@@ -1796,11 +2138,34 @@ fn App() -> impl IntoView {
                                             {slots}
                                         </div>
                                     </div>
-                                }
+                                }.into_any()
                     }}
                 </div>
             </div>
         </div>
+
+        // --- Support modal ---
+        <Show when=move || show_support_modal.get()>
+            <div class="modal-overlay" on:click=move |_| show_support_modal.set(false)>
+                <div class="modal-card" on:click=move |ev: web_sys::MouseEvent| ev.stop_propagation()>
+                    <h3 class="modal-title">"Gridora Forge just saved you time."</h3>
+                    <p class="modal-body">"How much was that worth? If this tool is useful to you, consider buying me a coffee. It keeps development going."</p>
+                    <div class="modal-actions">
+                        <a class="btn btn-accent" href="https://buymeacoffee.com/rcoopersnyder" target="_blank" rel="noreferrer">"\u{2615} Buy Me a Coffee"</a>
+                        <button class="btn btn-secondary" on:click=move |_| show_support_modal.set(false)>"Maybe Later"</button>
+                        <button class="btn-text" on:click=move |_| {
+                            show_support_modal.set(false);
+                            if let Ok(Some(storage)) = web_sys::window()
+                                .unwrap()
+                                .local_storage()
+                            {
+                                let _ = storage.set_item("gridora_support_dismissed", "1");
+                            }
+                        }>"Don\u{2019}t show again"</button>
+                    </div>
+                </div>
+            </div>
+        </Show>
     }
 }
 

@@ -1,7 +1,7 @@
 [build]
 target = "index.html"
 dist = "dist"
-public_url = "/gridora-forge/"
+public_url = "/"
 
 [serve]
 port = 8080

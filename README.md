@@ -3,25 +3,30 @@
 A simple Rust/WASM browser app that lets a user:
 
 - choose a folder of local photos or pick multiple image files
-- reorder the photos with Up / Down controls
+- load large image batches with parallel browser-side processing
+- reorder the photos with drag-and-drop or Up / Down controls
+- rotate photos before export
 - preview them in a 2×2 or 2×3 matrix
-- export a real `.xlsx` workbook
+- customize PDF margins plus header and footer text
 - open a print-ready layout and save it as PDF from the browser print dialog
+- reach support or feature-request links directly from the UI
 
 ## Simple map
 
 1. Pick local images.
 2. Reorder them.
-3. Choose `2 × 2` or `2 × 3`.
-4. Export to Excel or Print / Save PDF.
+3. Rotate or annotate them.
+4. Choose `1-up`, `2-up`, `2 × 2`, or `2 × 3`.
+5. Print / Save PDF.
 
 ## What is in this starter
 
 - **Rust + Leptos CSR** browser frontend
 - **No backend**
 - **Folder picker + multi-file picker**
-- **Excel export** via `rust_xlsxwriter`
+- **Parallel image ingest** with bounded concurrency
 - **PDF path** via a print-ready browser window
+- **Per-photo rotation** and **PDF margin/header/footer controls**
 - **One-command local dev** through Trunk
 
 ## Why this shape
@@ -31,7 +36,7 @@ This is the simplest understandable MVP that stays browser-first:
 - no install for end users once hosted
 - no server upload requirement
 - private local file handling
-- real workbook output
+- PDF-first report output
 - easy repo to extend with drag-and-drop, image resizing, crop controls, or persistent project saves later
 
 ## Local development on Windows
@@ -73,13 +78,10 @@ You can host the `dist/` directory on any static hosting provider.
 
 - Folder picking relies on browser support for directory inputs. The app also supports standard multi-file selection as a fallback.
 - The PDF flow opens a print-friendly tab and uses the browser print dialog. Choose **Save as PDF** there.
-- This starter keeps the image pipeline simple. It uses original image bytes for export and browser object URLs for preview. That keeps the code smaller for your first final repo.
-- A strong next iteration would add actual image resizing, drag-and-drop reordering, captions, and per-page margin controls.
+- The app compresses export images during ingest so PDFs stay materially smaller than the original camera files while keeping print quality usable.
+- Support and feature-request links are available in the left pane.
 
 ## Suggested next upgrades
 
-- drag-and-drop ordering
-- actual image resize/crop pipeline in Rust
-- page settings and margins
-- saved projects in browser storage
+- saved project drafts in browser storage
 - direct PDF byte generation instead of print dialog
