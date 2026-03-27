@@ -1,49 +1,42 @@
-# Photo Matrix WASM
+# Gridora Forge
 
-A simple Rust/WASM browser app that lets a user:
+**Free Construction Photo Report Generator**
+Drag. Drop. Label. Export to PDF.
+No installs · No uploads · 100% private in browser.
 
-- choose a folder of local photos or pick multiple image files
-- load large image batches with parallel browser-side processing
-- reorder the photos with drag-and-drop or Up / Down controls
-- rotate photos before export
-- preview them in a 2×2 or 2×3 matrix
-- customize PDF margins plus header and footer text
-- open a print-ready layout and save it as PDF from the browser print dialog
-- reach support or feature-request links directly from the UI
+**Live:** [www.gridora-forge.com](https://www.gridora-forge.com/)
 
-## Simple map
+## What it does
 
-1. Pick local images.
-2. Reorder them.
-3. Rotate or annotate them.
-4. Choose `1-up`, `2-up`, `2 × 2`, or `2 × 3`.
-5. Print / Save PDF.
+Gridora Forge turns jobsite photos into professional PDF photo reports in minutes. Built for construction workers, site inspectors, consultants, engineers, and anyone who needs to document a site with photos.
 
-## What is in this starter
+1. Drag and drop photos (or pick a folder)
+2. Add titles and descriptions
+3. Choose a layout
+4. Export to PDF
 
-- **Rust + Leptos CSR** browser frontend
-- **No backend**
-- **Folder picker + multi-file picker**
-- **Parallel image ingest** with bounded concurrency
-- **PDF path** via a print-ready browser window
-- **Per-photo rotation** and **PDF margin/header/footer controls**
-- **One-command local dev** through Trunk
+Everything runs locally in your browser — no server, no accounts, no uploads.
 
-## Why this shape
+## Features
 
-This is the simplest understandable MVP that stays browser-first:
+- **Multiple layouts** — 1-up, 2-up, 2×2, 2×3 grid
+- **Cover page** — title, site address, author, date, notes, company logo
+- **Photo controls** — drag-and-drop reorder, rotate, title + description per photo
+- **PDF settings** — configurable margins, header/footer templates with `{title}`, `{author}`, `{date}`, `{page}`, `{total_pages}` tokens, page numbers
+- **HEIC/iPhone support** — handles HEIC/HEIF from iOS cameras
+- **Deferred JPEG compression** — full-resolution originals until export, then compressed for smaller PDFs
+- **Parallel processing** — bounded concurrency for fast batch imports
+- **100% client-side** — Rust/WASM, no backend, photos never leave your device
 
-- no install for end users once hosted
-- no server upload requirement
-- private local file handling
-- PDF-first report output
-- easy repo to extend with drag-and-drop, image resizing, crop controls, or persistent project saves later
+## Tech stack
 
-## Local development on Windows
+- **Rust + Leptos 0.8 CSR** compiled to WebAssembly
+- **Trunk** for build/dev tooling
+- **No backend** — static site hosted on GitHub Pages
+
+## Local development
 
 ### Prerequisites
-
-Install Rust and the WASM target:
 
 ```powershell
 rustup target add wasm32-unknown-unknown
@@ -56,11 +49,7 @@ cargo install trunk --locked
 .\scripts\dev.ps1
 ```
 
-That runs:
-
-```powershell
-trunk serve
-```
+Opens at `http://localhost:8080/`.
 
 ### Production build
 
@@ -68,20 +57,12 @@ trunk serve
 .\scripts\build.ps1
 ```
 
-That writes the static site into `dist/`.
+Outputs static site to `dist/`.
 
-## Host it later
+## Hosting
 
-You can host the `dist/` directory on any static hosting provider.
+The `dist/` directory can be deployed to any static host. Currently served via GitHub Pages with a custom domain (`www.gridora-forge.com`).
 
-## Notes
+## License
 
-- Folder picking relies on browser support for directory inputs. The app also supports standard multi-file selection as a fallback.
-- The PDF flow opens a print-friendly tab and uses the browser print dialog. Choose **Save as PDF** there.
-- The app compresses export images during ingest so PDFs stay materially smaller than the original camera files while keeping print quality usable.
-- Support and feature-request links are available in the left pane.
-
-## Suggested next upgrades
-
-- saved project drafts in browser storage
-- direct PDF byte generation instead of print dialog
+[MIT](LICENSE)
