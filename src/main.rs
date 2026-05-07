@@ -23,7 +23,48 @@ fn next_photo_id() -> u64 {
 // defer the expensive export-JPEG compression to PDF-export time.
 thread_local! {
     static SOURCE_FILES: RefCell<HashMap<u64, web_sys::File>> = RefCell::new(HashMap::new());
+
+    // Cursor position shared between drag (mouse) and touch handlers,
+    // consumed by the auto-scroll interval. Set from `dragover` and `touchmove`.
+    static CURSOR_X: Cell<i32> = const { Cell::new(0) };
+    static CURSOR_Y: Cell<i32> = const { Cell::new(0) };
+
+    // Touch reorder state.
+    // - TOUCH_HOLD: cancel-on-drop handle for the long-press timer.
+    // - TOUCH_START: (x, y) of the initial touchstart for movement-threshold checks.
+    // - TOUCH_DRAG_ACTIVE: true once the long-press confirms a drag, used by the
+    //   global non-passive touchmove listener to call preventDefault().
+    static TOUCH_HOLD: RefCell<Option<gloo_timers::callback::Timeout>> =
+        const { RefCell::new(None) };
+    static TOUCH_START: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+    static TOUCH_DRAG_ACTIVE: Cell<bool> = const { Cell::new(false) };
+
+    // Source element captured at touchstart so the long-press timer can clone
+    // it into a floating ghost without a second elementFromPoint lookup.
+    static TOUCH_SOURCE_EL: RefCell<Option<web_sys::HtmlElement>> =
+        const { RefCell::new(None) };
+    // The floating ghost element appended to <body> while a touch drag is
+    // active. Removed in `touch_drag_cleanup`.
+    static TOUCH_GHOST: RefCell<Option<web_sys::HtmlElement>> =
+        const { RefCell::new(None) };
+    // Offset from the finger to the top-left corner of the ghost, captured at
+    // long-press confirm so the ghost stays anchored where the user grabbed it.
+    static TOUCH_GHOST_OFFSET: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+
+    // Sticky last-known-good drop indicator. The live `drop_indicator` signal
+    // gets cleared whenever the finger drifts back over the source row (or
+    // off any row), which would otherwise lose the user's intent at touchend.
+    // We persist the most recent valid insertion target here so the lift
+    // gesture always has a fallback. Reset by `touch_drag_cleanup`.
+    static TOUCH_LAST_INDICATOR: Cell<Option<usize>> = const { Cell::new(None) };
 }
+
+// Long-press hold duration before a touch becomes a drag. Matches the iOS
+// system convention closely enough that users won't notice.
+const TOUCH_HOLD_MS: u32 = 250;
+// If the finger moves more than this many CSS pixels before TOUCH_HOLD_MS
+// elapses, we treat the gesture as a scroll instead of a drag.
+const TOUCH_MOVE_THRESHOLD_PX: f64 = 8.0;
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -191,6 +232,257 @@ fn rotate_photo(items: &mut [PhotoItem], photo_id: u64, delta: i8) {
         let base = item.rotation_quadrants as i8;
         item.rotation_quadrants = (base + delta).rem_euclid(4) as u8;
     }
+}
+
+/// Compute the drop indicator position (insertion index) given a drag source
+/// and the row index the cursor is currently over, using vertical-midpoint
+/// logic. Mirrors the existing dragover handler in the photo list, extracted
+/// so touch and mouse paths share identical math.
+///
+/// Returns `None` when the cursor is on the source row itself (no movement).
+fn compute_drop_indicator(from: usize, target: usize, top: f64, height: f64, y: f64) -> Option<usize> {
+    if target == from {
+        return None;
+    }
+    let mid = top + height / 2.0;
+    let raw = if y <= mid { target } else { target + 1 };
+    // Snap out of the dead zone where the insertion point resolves to the
+    // same position as the source after the remove/insert adjustment.
+    let resolved = if raw == from || raw == from + 1 {
+        if target < from { target } else { target + 1 }
+    } else {
+        raw
+    };
+    Some(resolved)
+}
+
+/// Walk up from the topmost element under (x, y) until we find one with a
+/// `data-photo-idx` attribute. Returns the parsed index and the bounding rect
+/// of that element so callers can run midpoint logic.
+///
+/// Skips the floating touch-ghost subtree defensively in case CSS
+/// `pointer-events: none` is overridden somewhere.
+///
+/// Touch reorder reliability: on iOS Safari, `elementFromPoint` sometimes
+/// still returns a child of a fixed-position overlay even with
+/// `pointer-events: none`. We hide the ghost for the duration of the hit
+/// test, then restore its display, which is the canonical workaround used
+/// by every native-feel drag library.
+fn target_index_at_point(x: f64, y: f64) -> Option<(usize, web_sys::DomRect)> {
+    let doc = web_sys::window()?.document()?;
+
+    // Hide ghost for the hit test, restoring its prior display value.
+    let saved_display: Option<(web_sys::HtmlElement, String)> = TOUCH_GHOST.with(|g| {
+        g.borrow().as_ref().map(|ghost| {
+            let prev = ghost
+                .style()
+                .get_property_value("display")
+                .unwrap_or_default();
+            let _ = ghost.style().set_property("display", "none");
+            (ghost.clone(), prev)
+        })
+    });
+
+    let result = (|| -> Option<(usize, web_sys::DomRect)> {
+        let mut current = doc.element_from_point(x as f32, y as f32);
+        while let Some(el) = current {
+            if el.closest(".touch-ghost").ok().flatten().is_some() {
+                current = el.parent_element();
+                continue;
+            }
+            if let Some(idx_str) = el.get_attribute("data-photo-idx") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    let rect = el.get_bounding_client_rect();
+                    return Some((idx, rect));
+                }
+            }
+            current = el.parent_element();
+        }
+        None
+    })();
+
+    if let Some((ghost, prev)) = saved_display {
+        let _ = ghost.style().set_property("display", &prev);
+    }
+
+    // Fallback: if elementFromPoint missed (or was over a gap between rows),
+    // scan every [data-photo-idx] element and pick the one whose vertical
+    // band contains y. This guarantees we still resolve a target so the
+    // drop indicator shows up on every meaningful move.
+    if result.is_some() {
+        return result;
+    }
+    let nodes = doc.query_selector_all("[data-photo-idx]").ok()?;
+    let mut best: Option<(usize, web_sys::DomRect, f64)> = None;
+    for i in 0..nodes.length() {
+        let Some(node) = nodes.item(i) else { continue };
+        let Ok(el) = node.dyn_into::<web_sys::Element>() else { continue };
+        if el.closest(".touch-ghost").ok().flatten().is_some() {
+            continue;
+        }
+        let Some(idx_str) = el.get_attribute("data-photo-idx") else { continue };
+        let Ok(idx) = idx_str.parse::<usize>() else { continue };
+        let rect = el.get_bounding_client_rect();
+        // Only consider rows roughly horizontally aligned with the finger
+        // so multi-column preview grids still work.
+        if x < rect.left() - 4.0 || x > rect.right() + 4.0 {
+            continue;
+        }
+        let cy = rect.top() + rect.height() / 2.0;
+        let dist = (y - cy).abs();
+        if best.as_ref().is_none_or(|b| dist < b.2) {
+            best = Some((idx, rect, dist));
+        }
+    }
+    best.map(|(idx, rect, _)| (idx, rect))
+}
+
+/// Resolve a final drop indicator from a cursor position, using the same
+/// midpoint math as `compute_drop_indicator`. Used by touchend to recover
+/// when the last touchmove left `drop_indicator` as `None` (e.g., the finger
+/// was held still over the source row, or briefly outside any photo row).
+fn resolve_drop_indicator_at_point(from: usize, x: f64, y: f64) -> Option<usize> {
+    let (target, rect) = target_index_at_point(x, y)?;
+    compute_drop_indicator(from, target, rect.top(), rect.height(), y)
+}
+
+/// True if the pointerdown target is an interactive element where pointer
+/// input should pass through to the browser (text editing, button taps).
+fn pointer_target_is_interactive(ev: &web_sys::PointerEvent) -> bool {
+    let Some(target) = ev.target() else {
+        return false;
+    };
+    let Ok(el) = target.dyn_into::<web_sys::Element>() else {
+        return false;
+    };
+    // Walk up a few levels because the actual hit may be a child span/icon
+    // inside a <button>; we still want to treat the outer interactive
+    // ancestor as a pass-through.
+    let mut current: Option<web_sys::Element> = Some(el);
+    let mut depth = 0;
+    while let Some(node) = current {
+        let tag = node.tag_name();
+        if matches!(tag.as_str(), "INPUT" | "TEXTAREA" | "BUTTON" | "SELECT" | "A") {
+            return true;
+        }
+        if depth >= 3 {
+            break;
+        }
+        depth += 1;
+        current = node.parent_element();
+    }
+    false
+}
+
+fn body_class_add(name: &str) {
+    if let Some(body) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.body())
+    {
+        let _ = body.class_list().add_1(name);
+    }
+}
+
+fn body_class_remove(name: &str) {
+    if let Some(body) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.body())
+    {
+        let _ = body.class_list().remove_1(name);
+    }
+}
+
+/// End/cancel any pending touch-drag state. Idempotent.
+fn touch_drag_cleanup(
+    drag_idx: RwSignal<Option<usize>>,
+    drop_indicator: RwSignal<Option<usize>>,
+) {
+    TOUCH_HOLD.with(|h| h.borrow_mut().take()); // drops the timer = cancels it
+    TOUCH_DRAG_ACTIVE.with(|a| a.set(false));
+    drag_idx.set(None);
+    drop_indicator.set(None);
+    body_class_remove("touch-dragging");
+    touch_ghost_detach();
+    TOUCH_SOURCE_EL.with(|s| { s.borrow_mut().take(); });
+    TOUCH_LAST_INDICATOR.with(|l| l.set(None));
+}
+
+/// Clone the source row element into a fixed-position ghost overlay anchored
+/// to the user's finger. Called once at long-press confirm.
+fn touch_ghost_attach(x: f64, y: f64) {
+    let Some(window) = web_sys::window() else { return; };
+    let Some(document) = window.document() else { return; };
+    let Some(body) = document.body() else { return; };
+    let Some(source_el) = TOUCH_SOURCE_EL.with(|s| s.borrow().clone()) else { return; };
+
+    let rect = source_el.get_bounding_client_rect();
+    let offset_x = x - rect.left();
+    let offset_y = y - rect.top();
+    TOUCH_GHOST_OFFSET.with(|o| o.set((offset_x, offset_y)));
+
+    let Ok(node) = source_el.clone_node_with_deep(true) else { return; };
+    let Ok(ghost) = node.dyn_into::<web_sys::HtmlElement>() else { return; };
+
+    // Strip interactive children's IDs/names to keep the original DOM tree
+    // unique. Cheaply done via removeAttribute on the ghost root.
+    let _ = ghost.remove_attribute("id");
+    let _ = ghost.remove_attribute("data-photo-idx");
+    let _ = ghost.class_list().add_1("touch-ghost");
+
+    let style = ghost.style();
+    let _ = style.set_property("position", "fixed");
+    let _ = style.set_property("left", "0");
+    let _ = style.set_property("top", "0");
+    let _ = style.set_property("width", &format!("{}px", rect.width()));
+    let _ = style.set_property("height", &format!("{}px", rect.height()));
+    let _ = style.set_property("pointer-events", "none");
+    let _ = style.set_property("z-index", "9999");
+    let _ = style.set_property("opacity", "0.92");
+    let _ = style.set_property("box-shadow", "0 12px 32px rgba(0,0,0,0.35)");
+    let _ = style.set_property("transform-origin", "0 0");
+    let _ = style.set_property(
+        "transform",
+        &format!(
+            "translate({}px, {}px) scale(1.04)",
+            rect.left(),
+            rect.top()
+        ),
+    );
+    let _ = style.set_property("transition", "transform 90ms ease-out");
+
+    if body.append_child(ghost.as_ref()).is_ok() {
+        TOUCH_GHOST.with(|g| *g.borrow_mut() = Some(ghost));
+        // Snap to finger position on next frame so the lift animation reads.
+        touch_ghost_update(x, y);
+    }
+}
+
+/// Update the ghost's transform to follow the finger.
+fn touch_ghost_update(x: f64, y: f64) {
+    TOUCH_GHOST.with(|g| {
+        if let Some(ghost) = g.borrow().as_ref() {
+            let (off_x, off_y) = TOUCH_GHOST_OFFSET.with(|o| o.get());
+            let _ = ghost.style().set_property(
+                "transform",
+                &format!(
+                    "translate({}px, {}px) scale(1.04)",
+                    x - off_x,
+                    y - off_y
+                ),
+            );
+        }
+    });
+}
+
+/// Remove the ghost from the DOM if present.
+fn touch_ghost_detach() {
+    TOUCH_GHOST.with(|g| {
+        if let Some(ghost) = g.borrow_mut().take() {
+            if let Some(parent) = ghost.parent_node() {
+                let _ = parent.remove_child(ghost.as_ref());
+            }
+        }
+    });
 }
 
 fn update_photo_title(items: &mut [PhotoItem], photo_id: u64, title: String) {
@@ -705,13 +997,16 @@ fn build_print_html(
         }
     }
 
-    // Build a suggested filename for the PDF <title> tag
-    let pdf_filename = export_filename(meta, "pdf");
-    let title_esc = html_escape(if meta.title.is_empty() {
-        &pdf_filename
+    // Build a suggested filename for the PDF <title> tag.
+    // Skip the (Date::now-dependent) export_filename call when we have a
+    // meaningful title, which keeps `build_print_html` callable from host
+    // unit tests that have no JS context.
+    let title_esc = if meta.title.is_empty() {
+        let pdf_filename = export_filename(meta, "pdf");
+        html_escape(&pdf_filename)
     } else {
-        &meta.title
-    });
+        html_escape(&meta.title)
+    };
 
     format!(
         r#"<!doctype html>
@@ -724,18 +1019,22 @@ fn build_print_html(
 @page {{ size: letter; margin: 0; }}
 html, body {{ height: 100%; margin: 0; font-family: Arial, sans-serif; color: #111; background: #fff; }}
 
-/* Each .page is exactly one printed page.
+/* Each .page is exactly one printed page (US Letter, 8.5in x 11in).
+   Fixed physical units beat viewport-relative ones: mobile browsers report
+   viewport height that fluctuates with the address bar, which corrupts
+   page-break math.
    Margins are baked in as padding so the browser print dialog cannot override them. */
 .page {{
-  width: 100%;
-  height: 100vh;
+  width: 8.5in;
+  height: 11in;
   padding: {margin_top}in {margin_right}in {margin_bottom}in {margin_left}in;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   page-break-after: always;
+  break-after: page;
 }}
-.page:last-child {{ page-break-after: auto; }}
+.page:last-child {{ page-break-after: auto; break-after: auto; }}
 
 /* Optional header / footer chrome */
 .page-header,
@@ -1072,6 +1371,17 @@ fn App() -> impl IntoView {
         ev.prevent_default();
         drop_hover.set(false);
 
+        // If an internal reorder drag is still active when the event bubbles
+        // up here (e.g. dropped on an empty grid slot that has no drop
+        // handler), bail out. Otherwise Chromium auto-attaches the dragged
+        // <img> data to `dataTransfer.files`, and we'd "import" it as a new
+        // photo, duplicating the existing one.
+        if drag_idx.get().is_some() {
+            drag_idx.set(None);
+            drop_indicator.set(None);
+            return;
+        }
+
         if let Some(dt) = ev.data_transfer() {
             if let Some(list) = dt.files() {
                 let mut raw_files = Vec::new();
@@ -1207,16 +1517,12 @@ fn App() -> impl IntoView {
         handler.forget(); // Intentional: lives for the lifetime of the SPA
 
         // Global dragover: prevent no-drop cursor, track cursor position for auto-scroll
-        let cursor_y = Rc::new(Cell::new(0i32));
-        let cursor_x = Rc::new(Cell::new(0i32));
-        let cursor_y2 = cursor_y.clone();
-        let cursor_x2 = cursor_x.clone();
         let drag_handler =
             Closure::<dyn Fn(web_sys::DragEvent)>::new(move |ev: web_sys::DragEvent| {
                 if drag_idx.get().is_some() {
                     ev.prevent_default();
-                    cursor_y2.set(ev.client_y());
-                    cursor_x2.set(ev.client_x());
+                    CURSOR_X.with(|c| c.set(ev.client_x()));
+                    CURSOR_Y.with(|c| c.set(ev.client_y()));
                     if let Some(dt) = ev.data_transfer() {
                         dt.set_drop_effect("move");
                     }
@@ -1227,43 +1533,82 @@ fn App() -> impl IntoView {
             .ok();
         drag_handler.forget();
 
+        // Pointer Events API handles touch/mouse/pen via a unified path. The
+        // `touch-action` CSS on draggable rows tells the browser whether to
+        // claim the gesture for scrolling, so no manual non-passive listener
+        // is required to suppress page scroll during a confirmed drag.
+
         // Interval-based auto-scroll during drag (16ms ≈ 60fps)
         // Browsers suppress wheel events during native drag, so we scroll
-        // based on cursor proximity to pane edges.
+        // based on cursor proximity to pane edges. The same interval also
+        // covers touch reorder because touchmove updates CURSOR_X/Y.
+        //
+        // Mobile note: on narrow viewports the panes use `overflow-y: visible`
+        // and the body is the scroll container. If we can't find a scrollable
+        // pane ancestor, fall back to window scroll keyed off viewport edges.
         let scroll_cb = Closure::<dyn Fn()>::new(move || {
-            if drag_idx.get().is_none() {
+            // Active during either a mouse drag or a touch drag
+            let touch_active = TOUCH_DRAG_ACTIVE.with(|a| a.get());
+            if drag_idx.get().is_none() && !touch_active {
                 return;
             }
-            let y = cursor_y.get() as f64;
-            let x = cursor_x.get() as f32;
-            let doc = web_sys::window().unwrap().document().unwrap();
-            // Find the pane under the cursor
-            if let Some(el) = doc.element_from_point(x, cursor_y.get() as f32) {
+            let x = CURSOR_X.with(|c| c.get()) as f64;
+            let y = CURSOR_Y.with(|c| c.get()) as f64;
+            let window = web_sys::window().unwrap();
+            let doc = window.document().unwrap();
+            // Try pane-scroll first (desktop / tablet wide layout).
+            if let Some(el) = doc.element_from_point(x as f32, y as f32) {
                 let mut current: Option<web_sys::Element> = Some(el);
                 while let Some(node) = current {
                     let cls = node.class_name();
                     if cls.contains("left-pane") || cls.contains("right-pane") {
-                        let rect = node.get_bounding_client_rect();
-                        let edge = 80.0;
-                        let dist_top = y - rect.top();
-                        let dist_bottom = rect.bottom() - y;
-                        let speed = if dist_top < edge {
-                            // Scroll up: faster closer to edge
-                            -((edge - dist_top) / edge * 20.0)
-                        } else if dist_bottom < edge {
-                            // Scroll down
-                            (edge - dist_bottom) / edge * 20.0
-                        } else {
-                            0.0
-                        };
-                        if speed.abs() > 0.5 {
-                            let html: web_sys::HtmlElement = node.unchecked_into();
-                            html.set_scroll_top(html.scroll_top() + speed as i32);
+                        // Only treat the pane as the scroller if it's actually
+                        // scrollable in this layout; otherwise fall through to
+                        // window scroll below.
+                        let html_ref: &web_sys::HtmlElement = node.unchecked_ref();
+                        if html_ref.scroll_height() > html_ref.client_height() {
+                            let rect = node.get_bounding_client_rect();
+                            let edge = 80.0;
+                            let dist_top = y - rect.top();
+                            let dist_bottom = rect.bottom() - y;
+                            let speed = if dist_top < edge {
+                                -((edge - dist_top) / edge * 20.0)
+                            } else if dist_bottom < edge {
+                                (edge - dist_bottom) / edge * 20.0
+                            } else {
+                                0.0
+                            };
+                            if speed.abs() > 0.5 {
+                                html_ref.set_scroll_top(html_ref.scroll_top() + speed as i32);
+                            }
+                            return;
                         }
-                        return;
+                        break;
                     }
                     current = node.parent_element();
                 }
+            }
+            // Fallback: window-level auto-scroll keyed off viewport edges.
+            let viewport_h = window
+                .inner_height()
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            if viewport_h <= 0.0 {
+                return;
+            }
+            let edge = 80.0;
+            let dist_top = y;
+            let dist_bottom = viewport_h - y;
+            let speed = if dist_top < edge {
+                -((edge - dist_top) / edge * 20.0)
+            } else if dist_bottom < edge {
+                (edge - dist_bottom) / edge * 20.0
+            } else {
+                0.0
+            };
+            if speed.abs() > 0.5 {
+                window.scroll_by_with_x_and_y(0.0, speed);
             }
         });
         window
@@ -1280,7 +1625,7 @@ fn App() -> impl IntoView {
         <div class="app">
             <header class="toolbar">
                 <span class="brand">"Gridora Forge"</span>
-                <span class="version-badge">"v1.0.0"</span>
+                <span class="version-badge">"v1.0.1"</span>
                 <span class="toolbar-hint">"Drag. Drop. Label. Export to PDF."</span>
                 <div class="toolbar-group toolbar-left">
                     <label class="btn btn-primary">
@@ -1694,6 +2039,12 @@ fn App() -> impl IntoView {
                             on:drop=move |ev: web_sys::DragEvent| {
                                 ev.prevent_default();
                                 if let Some(from) = drag_idx.get() {
+                                    // Internal reorder — stop the event from bubbling
+                                    // up to the workspace `on_drop_files` handler, which
+                                    // would otherwise treat the dragged <img> data
+                                    // (auto-attached by Chromium) as a new file upload
+                                    // and duplicate the photo.
+                                    ev.stop_propagation();
                                     if let Some(target_pos) = drop_indicator.get() {
                                         let to = if from < target_pos {
                                             target_pos - 1
@@ -1776,6 +2127,7 @@ fn App() -> impl IntoView {
                                     view! {
                                         <div
                                             draggable=move || if row_focused.get() { "false" } else { "true" }
+                                            attr:data-photo-idx=move || idx().to_string()
                                             class=move || {
                                                 let index = idx();
                                                 let mut c = String::from("photo-row");
@@ -1806,22 +2158,24 @@ fn App() -> impl IntoView {
                                                     } else if let Some(target) = ev.current_target() {
                                                         let el: web_sys::Element = target.unchecked_into();
                                                         let rect = el.get_bounding_client_rect();
-                                                        let mid = rect.top() + rect.height() / 2.0;
-                                                        let raw = if (ev.client_y() as f64) <= mid { index } else { index + 1 };
-                                                        // Snap out of dead zone: positions `from` and `from+1` both
-                                                        // resolve to no-op after the remove/insert adjustment.
-                                                        let indicator = if raw == from || raw == from + 1 {
-                                                            if index < from { index } else { index + 1 }
+                                                        if let Some(ind) = compute_drop_indicator(
+                                                            from,
+                                                            index,
+                                                            rect.top(),
+                                                            rect.height(),
+                                                            ev.client_y() as f64,
+                                                        ) {
+                                                            drop_indicator.set(Some(ind));
                                                         } else {
-                                                            raw
-                                                        };
-                                                        drop_indicator.set(Some(indicator));
+                                                            drop_indicator.set(None);
+                                                        }
                                                     }
                                                 }
                                             }
                                             on:drop=move |ev: web_sys::DragEvent| {
                                                 ev.prevent_default();
                                                 if let Some(from) = drag_idx.get() {
+                                                    ev.stop_propagation();
                                                     if let Some(target_pos) = drop_indicator.get() {
                                                         let to = if from < target_pos {
                                                             target_pos - 1
@@ -1839,6 +2193,108 @@ fn App() -> impl IntoView {
                                             on:dragend=move |_| {
                                                 drag_idx.set(None);
                                                 drop_indicator.set(None);
+                                            }
+                                            on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                                // Mouse path stays on HTML5 DnD (handled by
+                                                // dragstart/dragover/drop above), so the desktop
+                                                // experience is unchanged.
+                                                if ev.pointer_type() == "mouse" { return; }
+                                                if row_focused.get() || pointer_target_is_interactive(&ev) {
+                                                    return;
+                                                }
+                                                if !ev.is_primary() { return; }
+                                                let x = ev.client_x() as f64;
+                                                let y = ev.client_y() as f64;
+                                                TOUCH_START.with(|s| s.set((x, y)));
+                                                CURSOR_X.with(|c| c.set(x as i32));
+                                                CURSOR_Y.with(|c| c.set(y as i32));
+                                                let pointer_id = ev.pointer_id();
+                                                if let Some(ct) = ev.current_target() {
+                                                    if let Ok(el) = ct.dyn_into::<web_sys::HtmlElement>() {
+                                                        // Capture the pointer so every pointermove/up
+                                                        // fires on this element regardless of where
+                                                        // the finger goes — the W3C-blessed way to
+                                                        // implement drag.
+                                                        let _ = el.set_pointer_capture(pointer_id);
+                                                        TOUCH_SOURCE_EL.with(|s| *s.borrow_mut() = Some(el));
+                                                    }
+                                                }
+                                                let source_idx = idx();
+                                                let timer = gloo_timers::callback::Timeout::new(
+                                                    TOUCH_HOLD_MS,
+                                                    move || {
+                                                        TOUCH_DRAG_ACTIVE.with(|a| a.set(true));
+                                                        drag_idx.set(Some(source_idx));
+                                                        drop_indicator.set(None);
+                                                        body_class_add("touch-dragging");
+                                                        let (sx, sy) = TOUCH_START.with(|s| s.get());
+                                                        touch_ghost_attach(sx, sy);
+                                                    },
+                                                );
+                                                TOUCH_HOLD.with(|h| *h.borrow_mut() = Some(timer));
+                                            }
+                                            on:pointermove=move |ev: web_sys::PointerEvent| {
+                                                if ev.pointer_type() == "mouse" { return; }
+                                                let x = ev.client_x() as f64;
+                                                let y = ev.client_y() as f64;
+                                                CURSOR_X.with(|c| c.set(x as i32));
+                                                CURSOR_Y.with(|c| c.set(y as i32));
+                                                // Pre-confirm: cancel hold timer if user is scrolling
+                                                if !TOUCH_DRAG_ACTIVE.with(|a| a.get()) {
+                                                    let (sx, sy) = TOUCH_START.with(|s| s.get());
+                                                    if (x - sx).abs() > TOUCH_MOVE_THRESHOLD_PX
+                                                        || (y - sy).abs() > TOUCH_MOVE_THRESHOLD_PX
+                                                    {
+                                                        TOUCH_HOLD.with(|h| h.borrow_mut().take());
+                                                        TOUCH_SOURCE_EL.with(|s| s.borrow_mut().take());
+                                                    }
+                                                    return;
+                                                }
+                                                // Confirmed drag: update ghost + drop target
+                                                touch_ghost_update(x, y);
+                                                if let Some(from) = drag_idx.get() {
+                                                    if let Some((target_idx, rect)) = target_index_at_point(x, y) {
+                                                        if let Some(ind) = compute_drop_indicator(
+                                                            from, target_idx, rect.top(), rect.height(), y,
+                                                        ) {
+                                                            drop_indicator.set(Some(ind));
+                                                            TOUCH_LAST_INDICATOR.with(|l| l.set(Some(ind)));
+                                                        } else {
+                                                            drop_indicator.set(None);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            on:pointerup=move |ev: web_sys::PointerEvent| {
+                                                if ev.pointer_type() == "mouse" { return; }
+                                                let was_dragging = TOUCH_DRAG_ACTIVE.with(|a| a.get());
+                                                if was_dragging {
+                                                    if let Some(from) = drag_idx.get() {
+                                                        let target_pos = drop_indicator
+                                                            .get()
+                                                            .or_else(|| TOUCH_LAST_INDICATOR.with(|l| l.get()))
+                                                            .or_else(|| {
+                                                                let x = CURSOR_X.with(|c| c.get()) as f64;
+                                                                let y = CURSOR_Y.with(|c| c.get()) as f64;
+                                                                resolve_drop_indicator_at_point(from, x, y)
+                                                            });
+                                                        if let Some(target_pos) = target_pos {
+                                                            let to = if from < target_pos {
+                                                                target_pos - 1
+                                                            } else {
+                                                                target_pos
+                                                            };
+                                                            if from != to {
+                                                                photos.update(|items| move_item(items, from, to));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                touch_drag_cleanup(drag_idx, drop_indicator);
+                                            }
+                                            on:pointercancel=move |ev: web_sys::PointerEvent| {
+                                                if ev.pointer_type() == "mouse" { return; }
+                                                touch_drag_cleanup(drag_idx, drop_indicator);
                                             }
                                         >
                                             <div class="thumb">
@@ -1868,8 +2324,8 @@ fn App() -> impl IntoView {
                                                             aria-label="Rotate clockwise"
                                                             title="Rotate clockwise"
                                                         >"\u{21BB}"</button>
-                                                        <button on:click=move_up disabled=move || idx() == 0 aria-label="Move up">"\u{25B2}"</button>
-                                                        <button on:click=move_down disabled=is_last aria-label="Move down">"\u{25BC}"</button>
+                                                        <button class="btn-move" on:click=move_up disabled=move || idx() == 0 aria-label="Move up" title="Move up">"\u{25B2}"</button>
+                                                        <button class="btn-move" on:click=move_down disabled=is_last aria-label="Move down" title="Move down">"\u{25BC}"</button>
                                                         <button class="btn-danger" on:click=remove aria-label="Remove">"\u{2715}"</button>
                                                     </div>
                                                 </div>
@@ -2036,6 +2492,7 @@ fn App() -> impl IntoView {
                                             view! {
                                                 <div
                                                     draggable="true"
+                                                    attr:data-photo-idx=flat_idx.to_string()
                                                     class=move || {
                                                         let mut c = String::from("slot filled");
                                                         if drag_idx.get() == Some(flat_idx) {
@@ -2087,6 +2544,7 @@ fn App() -> impl IntoView {
                                                     on:drop=move |ev: web_sys::DragEvent| {
                                                         ev.prevent_default();
                                                         if let Some(from) = drag_idx.get() {
+                                                            ev.stop_propagation();
                                                             if let Some(target_pos) = drop_indicator.get() {
                                                                 let to = if from < target_pos {
                                                                     target_pos - 1
@@ -2104,6 +2562,116 @@ fn App() -> impl IntoView {
                                                     on:dragend=move |_| {
                                                         drag_idx.set(None);
                                                         drop_indicator.set(None);
+                                                    }
+                                                    on:pointerdown=move |ev: web_sys::PointerEvent| {
+                                                        if ev.pointer_type() == "mouse" { return; }
+                                                        if pointer_target_is_interactive(&ev) { return; }
+                                                        if !ev.is_primary() { return; }
+                                                        let x = ev.client_x() as f64;
+                                                        let y = ev.client_y() as f64;
+                                                        TOUCH_START.with(|s| s.set((x, y)));
+                                                        CURSOR_X.with(|c| c.set(x as i32));
+                                                        CURSOR_Y.with(|c| c.set(y as i32));
+                                                        let pointer_id = ev.pointer_id();
+                                                        if let Some(ct) = ev.current_target() {
+                                                            if let Ok(el) = ct.dyn_into::<web_sys::HtmlElement>() {
+                                                                let _ = el.set_pointer_capture(pointer_id);
+                                                                TOUCH_SOURCE_EL.with(|s| *s.borrow_mut() = Some(el));
+                                                            }
+                                                        }
+                                                        let source_idx = flat_idx;
+                                                        let timer = gloo_timers::callback::Timeout::new(
+                                                            TOUCH_HOLD_MS,
+                                                            move || {
+                                                                TOUCH_DRAG_ACTIVE.with(|a| a.set(true));
+                                                                drag_idx.set(Some(source_idx));
+                                                                drop_indicator.set(None);
+                                                                body_class_add("touch-dragging");
+                                                                let (sx, sy) = TOUCH_START.with(|s| s.get());
+                                                                touch_ghost_attach(sx, sy);
+                                                            },
+                                                        );
+                                                        TOUCH_HOLD.with(|h| *h.borrow_mut() = Some(timer));
+                                                    }
+                                                    on:pointermove=move |ev: web_sys::PointerEvent| {
+                                                        if ev.pointer_type() == "mouse" { return; }
+                                                        let x = ev.client_x() as f64;
+                                                        let y = ev.client_y() as f64;
+                                                        CURSOR_X.with(|c| c.set(x as i32));
+                                                        CURSOR_Y.with(|c| c.set(y as i32));
+                                                        if !TOUCH_DRAG_ACTIVE.with(|a| a.get()) {
+                                                            let (sx, sy) = TOUCH_START.with(|s| s.get());
+                                                            if (x - sx).abs() > TOUCH_MOVE_THRESHOLD_PX
+                                                                || (y - sy).abs() > TOUCH_MOVE_THRESHOLD_PX
+                                                            {
+                                                                TOUCH_HOLD.with(|h| h.borrow_mut().take());
+                                                                TOUCH_SOURCE_EL.with(|s| s.borrow_mut().take());
+                                                            }
+                                                            return;
+                                                        }
+                                                        touch_ghost_update(x, y);
+                                                        if let Some(from) = drag_idx.get() {
+                                                            if let Some((target_idx, rect)) = target_index_at_point(x, y) {
+                                                                let raw = if num_cols > 1 {
+                                                                    let mid_x = rect.left() + rect.width() / 2.0;
+                                                                    let mid_y = rect.top() + rect.height() / 2.0;
+                                                                    let in_left = x <= mid_x;
+                                                                    let in_top = y <= mid_y;
+                                                                    if target_idx == from {
+                                                                        target_idx
+                                                                    } else if in_top || in_left {
+                                                                        target_idx
+                                                                    } else {
+                                                                        target_idx + 1
+                                                                    }
+                                                                } else {
+                                                                    let mid = rect.top() + rect.height() / 2.0;
+                                                                    if y <= mid { target_idx } else { target_idx + 1 }
+                                                                };
+                                                                if target_idx == from {
+                                                                    drop_indicator.set(None);
+                                                                } else {
+                                                                    let indicator = if raw == from || raw == from + 1 {
+                                                                        if target_idx < from { target_idx } else { target_idx + 1 }
+                                                                    } else {
+                                                                        raw
+                                                                    };
+                                                                    drop_indicator.set(Some(indicator));
+                                                                    TOUCH_LAST_INDICATOR.with(|l| l.set(Some(indicator)));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    on:pointerup=move |ev: web_sys::PointerEvent| {
+                                                        if ev.pointer_type() == "mouse" { return; }
+                                                        let was_dragging = TOUCH_DRAG_ACTIVE.with(|a| a.get());
+                                                        if was_dragging {
+                                                            if let Some(from) = drag_idx.get() {
+                                                                let target_pos = drop_indicator
+                                                                    .get()
+                                                                    .or_else(|| TOUCH_LAST_INDICATOR.with(|l| l.get()))
+                                                                    .or_else(|| {
+                                                                        let x = CURSOR_X.with(|c| c.get()) as f64;
+                                                                        let y = CURSOR_Y.with(|c| c.get()) as f64;
+                                                                        resolve_drop_indicator_at_point(from, x, y)
+                                                                    });
+                                                                if let Some(target_pos) = target_pos {
+                                                                    let to = if from < target_pos {
+                                                                        target_pos - 1
+                                                                    } else {
+                                                                        target_pos
+                                                                    };
+                                                                    if from != to {
+                                                                        photos.update(|items| move_item(items, from, to));
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        touch_drag_cleanup(drag_idx, drop_indicator);
+                                                    }
+                                                    on:pointercancel=move |ev: web_sys::PointerEvent| {
+                                                        if ev.pointer_type() == "mouse" { return; }
+                                                        touch_drag_cleanup(drag_idx, drop_indicator);
                                                     }
                                                 >
                                                     <div class="slot-media">
@@ -2172,4 +2740,196 @@ fn App() -> impl IntoView {
 fn main() {
     console_error_panic_hook::set_once();
     mount_to_body(App);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// These tests run on the host (`cargo test --target x86_64-pc-windows-msvc`
+// or default host target) and exercise pure logic only. The wasm32 target has
+// no `cfg(test)` harness, so anything here must avoid web_sys.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_photo(id: u64) -> PhotoItem {
+        PhotoItem {
+            id,
+            title: format!("p{id}"),
+            description: String::new(),
+            filename: format!("p{id}.jpg"),
+            mime: "image/jpeg".to_string(),
+            rotation_quadrants: 0,
+            thumb_url: String::new(),
+            preview_url: String::new(),
+        }
+    }
+
+    fn test_meta() -> ReportMeta {
+        ReportMeta {
+            title: "TestReport".to_string(),
+            ..ReportMeta::default()
+        }
+    }
+
+    // --- move_item invariants (covers both desktop drag and touch reorder
+    //     since both code paths funnel through this function) -----------
+
+    #[test]
+    fn move_item_forward_preserves_other_order() {
+        let mut v: Vec<PhotoItem> = (1..=5).map(make_photo).collect();
+        move_item(&mut v, 0, 3);
+        let ids: Vec<u64> = v.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![2, 3, 4, 1, 5]);
+    }
+
+    #[test]
+    fn move_item_backward_preserves_other_order() {
+        let mut v: Vec<PhotoItem> = (1..=5).map(make_photo).collect();
+        move_item(&mut v, 4, 1);
+        let ids: Vec<u64> = v.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1, 5, 2, 3, 4]);
+    }
+
+    #[test]
+    fn move_item_no_op_for_same_index() {
+        let mut v: Vec<PhotoItem> = (1..=3).map(make_photo).collect();
+        move_item(&mut v, 1, 1);
+        let ids: Vec<u64> = v.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn move_item_out_of_bounds_is_noop() {
+        let mut v: Vec<PhotoItem> = (1..=3).map(make_photo).collect();
+        move_item(&mut v, 0, 10);
+        let ids: Vec<u64> = v.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    // --- compute_drop_indicator: snap-out-of-deadzone semantics --------
+
+    #[test]
+    fn drop_indicator_above_midpoint_inserts_before_target() {
+        // Source row 0 dragging onto row 3, finger near top → insert at 3
+        let r = compute_drop_indicator(0, 3, 100.0, 60.0, 110.0);
+        assert_eq!(r, Some(3));
+    }
+
+    #[test]
+    fn drop_indicator_below_midpoint_inserts_after_target() {
+        let r = compute_drop_indicator(0, 3, 100.0, 60.0, 150.0);
+        assert_eq!(r, Some(4));
+    }
+
+    #[test]
+    fn drop_indicator_on_source_returns_none() {
+        let r = compute_drop_indicator(2, 2, 100.0, 60.0, 130.0);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn drop_indicator_avoids_dead_zone_above() {
+        // Source 2, target 1, above midpoint → raw = 1 (= source - 1).
+        // 1 == from would be false (from=2), 1 == from+1 = 3 false.
+        // So the indicator should be 1 with no snap. Verify.
+        let r = compute_drop_indicator(2, 1, 100.0, 60.0, 110.0);
+        assert_eq!(r, Some(1));
+    }
+
+    #[test]
+    fn drop_indicator_avoids_dead_zone_below() {
+        // Source 2, target 2 → returns None (handled by source check).
+        // Source 2, target 1, below midpoint → raw = 2 == from, snap.
+        // target < from so result = target = 1.
+        let r = compute_drop_indicator(2, 1, 100.0, 60.0, 150.0);
+        assert_eq!(r, Some(1));
+    }
+
+    // --- Print HTML invariants (regression guards for mobile fix) -------
+
+    #[test]
+    fn print_html_uses_letter_dimensions_not_viewport() {
+        let photos = vec![make_photo(1)];
+        let mut export_bytes = HashMap::new();
+        export_bytes.insert(1u64, vec![0xFFu8, 0xD8, 0xFF, 0xD9]); // tiny jpeg stub
+        let meta = test_meta();
+        let settings = PdfSettings::default();
+        let html = build_print_html(
+            &photos,
+            &export_bytes,
+            GridLayout::OneUp,
+            &meta,
+            &settings,
+            false,
+            false,
+        );
+        // Mobile fix: must use physical inch units, never the unreliable
+        // mobile-viewport-relative `100vh`.
+        assert!(
+            !html.contains("100vh"),
+            "print HTML still references 100vh; will misalign pages on mobile"
+        );
+        assert!(
+            html.contains("11in"),
+            "print HTML missing 11in page height"
+        );
+        assert!(
+            html.contains("8.5in"),
+            "print HTML missing 8.5in page width"
+        );
+        assert!(
+            html.contains("@page"),
+            "print HTML missing @page rule"
+        );
+    }
+
+    #[test]
+    fn print_html_includes_one_section_per_page() {
+        // 5 photos at TwoByTwo (page size 4) = 2 photo pages
+        let photos: Vec<PhotoItem> = (1..=5).map(make_photo).collect();
+        let mut export_bytes = HashMap::new();
+        for p in &photos {
+            export_bytes.insert(p.id, vec![0xFFu8, 0xD8, 0xFF, 0xD9]);
+        }
+        let html = build_print_html(
+            &photos,
+            &export_bytes,
+            GridLayout::TwoByTwo,
+            &test_meta(),
+            &PdfSettings::default(),
+            false,
+            false,
+        );
+        let section_count = html.matches(r#"<section class="page"#).count();
+        assert_eq!(section_count, 2, "expected 2 photo pages for 5 photos at 2x2");
+    }
+
+    #[test]
+    fn print_html_preserves_photo_order() {
+        // Invariant: photo order in UI equals photo order in export
+        let photos: Vec<PhotoItem> = (1..=4).map(make_photo).collect();
+        let mut export_bytes = HashMap::new();
+        for p in &photos {
+            export_bytes.insert(p.id, vec![0xFFu8]);
+        }
+        let html = build_print_html(
+            &photos,
+            &export_bytes,
+            GridLayout::OneUp,
+            &test_meta(),
+            &PdfSettings::default(),
+            false,
+            false,
+        );
+        let pos_p1 = html.find("alt=\"p1\"").expect("p1 missing");
+        let pos_p2 = html.find("alt=\"p2\"").expect("p2 missing");
+        let pos_p3 = html.find("alt=\"p3\"").expect("p3 missing");
+        let pos_p4 = html.find("alt=\"p4\"").expect("p4 missing");
+        assert!(pos_p1 < pos_p2);
+        assert!(pos_p2 < pos_p3);
+        assert!(pos_p3 < pos_p4);
+    }
 }
